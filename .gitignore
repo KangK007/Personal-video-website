@@ -1,13 +1,36 @@
+# Dependencies and build output
 node_modules/
 .next/
 out/
+dist/
+build/
 .npm-cache/
+.turbo/
+.vercel/
+coverage/
 *.tsbuildinfo
-*.log
-__pycache__/
-*.py[cod]
-.DS_Store
-.env*
-!.env.example
+
+# Local application state, credentials, logs, and exports
 .local/
 outputs/
+logs/
+.env*
+!.env.example
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python and process artifacts
+__pycache__/
+*.py[cod]
+*.pid
+
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

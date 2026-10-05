@@ -38,7 +38,7 @@ Git 仓库只保存源码、配置模板、锁文件、测试和说明文档。�
 
 ## 当前验证基线
 
-- 单元测试：8 个测试文件，38 个测试通过。
+- 单元测试：8 个测试文件，42 个测试通过。
 - TypeScript：`npm run typecheck` 通过。
 - ESLint：`npm run lint` 通过。
 - Next.js 生产构建：`npm run build` 通过。
