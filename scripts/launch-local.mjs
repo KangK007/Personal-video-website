@@ -11,6 +11,7 @@ import {
 } from "./local-process.mjs";
 
 const localRoot = path.join(projectRoot, ".local");
+const personalDataBackupRoot = path.join(localRoot, "personal-data", "backups");
 const sidecarRoot = path.join(localRoot, "Douyin_TikTok_Download_API");
 const sidecarPython = path.join(sidecarRoot, ".venv", "Scripts", "python.exe");
 const sidecarEntry = path.join(projectRoot, "scripts", "sidecar-entry.py");
@@ -49,6 +50,7 @@ function readSidecarToken() {
 const sidecarToken = readSidecarToken();
 
 mkdirSync(runtimeRoot, { recursive: true });
+mkdirSync(personalDataBackupRoot, { recursive: true });
 
 const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
 if (nodeMajor !== 24) {

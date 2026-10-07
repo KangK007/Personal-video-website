@@ -102,11 +102,11 @@ describe("syncBilibiliCreator", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects repeated pages when the total is unavailable", async () => {
+  it("rejects repeated pages when the reported total is not reached", async () => {
     const repeatedItem = { bvid: "BV1abcDEF12", title: "重复投稿" };
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(jsonResponse(videoPage([repeatedItem], { pn: 1, ps: 1 })))
-      .mockResolvedValueOnce(jsonResponse(videoPage([repeatedItem], { pn: 2, ps: 1 })));
+      .mockResolvedValueOnce(jsonResponse(videoPage([repeatedItem], { pn: 1, ps: 1, count: 2 })))
+      .mockResolvedValueOnce(jsonResponse(videoPage([repeatedItem], { pn: 2, ps: 1, count: 2 })));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(syncBilibiliCreator(
@@ -115,6 +115,74 @@ describe("syncBilibiliCreator", () => {
       syncedAt,
     )).rejects.toThrow("分页重复");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops safely when the sidecar omits pagination metadata", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(videoPage([
+        { bvid: "BV1abcDEF12", title: "缺少分页信息" },
+      ], { pn: 1 })))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, data: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      syncedAt,
+    )).rejects.toThrow("分页元数据");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat a short page without a total count as a complete snapshot", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(videoPage([
+      { bvid: "BV1abcDEF12", title: "总数缺失" },
+    ], { pn: 1, ps: 30 })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      syncedAt,
+    )).rejects.toThrow("分页元数据");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not turn an unconfirmed empty page into an empty snapshot", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(videoPage([], { pn: 1, ps: 30, count: 1 })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      syncedAt,
+    )).rejects.toThrow("分页提前结束");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts an explicitly confirmed empty account", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(videoPage([], { pn: 1, ps: 30, count: 0 })))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, data: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      syncedAt,
+    )).resolves.toMatchObject({ videos: [], mode: "snapshot" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([null, "", false])("rejects an empty account when count is %s instead of an explicit zero", async (count) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(videoPage([], { pn: 1, ps: 30, count })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      syncedAt,
+    )).rejects.toThrow("分页元数据不完整");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("retries a transient sidecar response before accepting the page", async () => {

@@ -62,6 +62,49 @@ function normalizeHttpUrl(value: unknown, platform?: Creator["platform"]) {
   }
 }
 
+function fallbackIdentityKey(value: unknown, platform: Creator["platform"]) {
+  const raw = asOptionalString(value) ?? "";
+  try {
+    const url = new URL(raw);
+    return `${platform}:url:${url.host.toLowerCase()}${url.pathname.replace(/\/+$/, "") || "/"}`;
+  } catch {
+    return `${platform}:url:${raw.toLowerCase()}`;
+  }
+}
+
+export function getFeedCreatorIdentityKey(value: unknown, platform: Creator["platform"]) {
+  const normalized = normalizeHttpUrl(value, platform);
+  if (!normalized) return fallbackIdentityKey(value, platform);
+  const url = new URL(normalized);
+  const id = platform === "bilibili"
+    ? url.pathname.match(/^\/(?:space\/)?(\d+)(?:\/|$)/i)?.[1]
+    : url.pathname.match(/^\/user\/([^/]+)\/?$/i)?.[1];
+  return id ? `${platform}:creator:${id}` : fallbackIdentityKey(normalized, platform);
+}
+
+function getBilibiliPageNumber(url: URL) {
+  const value = url.searchParams.get("p");
+  if (!value || !/^\d+$/.test(value)) return 1;
+  const page = Number(value);
+  return Number.isSafeInteger(page) && page > 0 ? page : 1;
+}
+
+function getPlatformVideoIdentity(value: unknown, platform: VideoItem["platform"]) {
+  const normalized = normalizeHttpUrl(value, platform);
+  if (!normalized) return null;
+  const url = new URL(normalized);
+  const id = platform === "bilibili"
+    ? url.pathname.match(/^\/video\/(BV[0-9A-Za-z]{8,20})(?:\/|$)/i)?.[1]
+    : url.pathname.match(/^\/video\/(\d{10,})(?:\/|$)/)?.[1];
+  return id ? { id, page: platform === "bilibili" ? getBilibiliPageNumber(url) : 1 } : null;
+}
+
+export function getFeedVideoIdentityKey(value: unknown, platform: VideoItem["platform"]) {
+  const identity = getPlatformVideoIdentity(value, platform);
+  if (identity) return `${platform}:video:${identity.id}${platform === "bilibili" ? `:p${identity.page}` : ""}`;
+  return fallbackIdentityKey(value, platform);
+}
+
 function migrateCreator(value: unknown, version: number): Creator | null {
   if (!value || typeof value !== "object") return null;
   const item = value as Partial<Creator>;
@@ -122,15 +165,30 @@ function migrateVideo(value: unknown): VideoItem | null {
 
 function canonicalFeedSyncId(video: VideoItem) {
   if (video.source !== "feed-sync") return video.id;
-  try {
-    const pathname = new URL(video.videoUrl).pathname;
-    const platformId = video.platform === "bilibili"
-      ? pathname.match(/^\/video\/(BV[0-9A-Za-z]{8,20})(?:\/|$)/i)?.[1]
-      : pathname.match(/^\/video\/(\d+)(?:\/|$)/)?.[1];
-    return platformId ? `sync-${video.platform}-${platformId}` : video.id;
-  } catch {
-    return video.id;
-  }
+  const identity = getPlatformVideoIdentity(video.videoUrl, video.platform);
+  if (!identity) return video.id;
+  const partSuffix = video.platform === "bilibili" && identity.page > 1 ? `-p${identity.page}` : "";
+  return `sync-${video.platform}-${identity.id}${partSuffix}`;
+}
+
+const VIDEO_SOURCE_PRIORITY: Record<VideoItem["source"], number> = {
+  manual: 3,
+  "public-metadata": 2,
+  "feed-sync": 1,
+  sample: 0,
+};
+
+function mergeRecoveredVideos(existing: VideoItem, incoming: VideoItem): VideoItem {
+  const preferred = VIDEO_SOURCE_PRIORITY[incoming.source] > VIDEO_SOURCE_PRIORITY[existing.source]
+    ? incoming
+    : existing;
+  const secondary = preferred === existing ? incoming : existing;
+  return {
+    ...preferred,
+    ...(preferred.coverUrl || secondary.coverUrl ? { coverUrl: preferred.coverUrl ?? secondary.coverUrl } : {}),
+    ...(preferred.publishedAt || secondary.publishedAt ? { publishedAt: preferred.publishedAt ?? secondary.publishedAt } : {}),
+    ...(preferred.duration || secondary.duration ? { duration: preferred.duration ?? secondary.duration } : {}),
+  };
 }
 
 function normalizeFeedState(value: unknown, recoverStoredRecords: boolean) {
@@ -143,44 +201,75 @@ function normalizeFeedState(value: unknown, recoverStoredRecords: boolean) {
 
   const migratedCreators: Creator[] = [];
   const creatorById = new Map<string, Creator>();
-  const creatorUrls = new Set<string>();
+  const creatorIdByIdentity = new Map<string, string>();
+  const creatorIdAliases = new Map<string, string>();
   let repaired = 0;
   for (const rawCreator of candidate.creators) {
     const creator = migrateCreator(rawCreator, rawVersion);
-    const urlKey = creator?.profileUrl.toLowerCase();
-    if (!creator || creatorById.has(creator.id) || !urlKey || creatorUrls.has(urlKey)) {
+    const urlKey = creator ? getFeedCreatorIdentityKey(creator.profileUrl, creator.platform) : undefined;
+    if (!creator || !urlKey) {
       if (!recoverStoredRecords) return null;
       repaired += 1;
       continue;
     }
+    const existingId = creatorById.has(creator.id) ? creator.id : creatorIdByIdentity.get(urlKey);
+    if (existingId) {
+      if (!recoverStoredRecords) return null;
+      repaired += 1;
+      creatorIdAliases.set(creator.id, existingId);
+      continue;
+    }
     creatorById.set(creator.id, creator);
-    creatorUrls.add(urlKey);
+    creatorIdByIdentity.set(urlKey, creator.id);
     migratedCreators.push(creator);
   }
 
   const migratedVideos: VideoItem[] = [];
   const videoIds = new Set<string>();
-  const videoUrls = new Set<string>();
+  const videoIndexByIdentity = new Map<string, number>();
   for (const rawVideo of candidate.videos) {
     const migrated = migrateVideo(rawVideo);
-    const creator = migrated ? creatorById.get(migrated.creatorId) : undefined;
-    if (!migrated || !creator || creator.platform !== migrated.platform) {
+    if (!migrated) {
       if (!recoverStoredRecords) return null;
       repaired += 1;
       continue;
     }
 
-    const canonicalId = canonicalFeedSyncId(migrated);
-    const normalized = canonicalId === migrated.id ? migrated : { ...migrated, id: canonicalId };
-    if (canonicalId !== migrated.id) repaired += 1;
-    const urlKey = normalized.videoUrl.toLowerCase();
-    if (videoIds.has(normalized.id) || videoUrls.has(urlKey)) {
+    const creatorId = creatorIdAliases.get(migrated.creatorId) ?? migrated.creatorId;
+    const creator = creatorById.get(creatorId);
+    if (!creator || creator.platform !== migrated.platform) {
+      if (!recoverStoredRecords) return null;
+      repaired += 1;
+      continue;
+    }
+
+    const attached = creatorId === migrated.creatorId ? migrated : { ...migrated, creatorId };
+    if (attached.creatorId !== migrated.creatorId) repaired += 1;
+    const canonicalId = canonicalFeedSyncId(attached);
+    const normalized = canonicalId === attached.id ? attached : { ...attached, id: canonicalId };
+    if (canonicalId !== attached.id) repaired += 1;
+    const urlKey = getFeedVideoIdentityKey(normalized.videoUrl, normalized.platform);
+    const existingIndex = videoIndexByIdentity.get(urlKey);
+    if (existingIndex !== undefined) {
+      if (!recoverStoredRecords) return null;
+      repaired += 1;
+      const existing = migratedVideos[existingIndex];
+      videoIds.delete(existing.id);
+      const preferred = mergeRecoveredVideos(existing, normalized);
+      const merged = videoIds.has(preferred.id)
+        ? { ...preferred, id: existing.id }
+        : preferred;
+      migratedVideos[existingIndex] = merged;
+      videoIds.add(merged.id);
+      continue;
+    }
+    if (videoIds.has(normalized.id)) {
       if (!recoverStoredRecords) return null;
       repaired += 1;
       continue;
     }
     videoIds.add(normalized.id);
-    videoUrls.add(urlKey);
+    videoIndexByIdentity.set(urlKey, migratedVideos.length);
     migratedVideos.push(normalized);
   }
 

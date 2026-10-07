@@ -121,6 +121,20 @@ export function parseDouyinPostPayload(body: string, status: number) {
     );
   }
   const hasMore = record.has_more === true || Number(record.has_more) === 1;
+  const hasExplicitEnd = Object.hasOwn(record, "has_more")
+    && (record.has_more === false || record.has_more === 0 || record.has_more === "0");
+  if (record.aweme_list.length === 0 && !hasExplicitEnd) {
+    throw new DouyinSyncError(
+      "抖音返回未确认结束的空投稿列表，疑似触发限流或登录状态异常；已有缓存已保留",
+      "douyin_empty_response",
+    );
+  }
+  if (record.aweme_list.some((item) => !/^\d+$/.test(String(asRecord(item).aweme_id ?? "")))) {
+    throw new DouyinSyncError(
+      "抖音投稿缺少有效作品 ID，响应不完整；已有缓存已保留",
+      "douyin_invalid_response",
+    );
+  }
   const cursor = record.max_cursor === undefined || record.max_cursor === null
     ? null
     : String(record.max_cursor);

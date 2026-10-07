@@ -35,7 +35,34 @@ npm ci
 npm run start:local
 ```
 
-`start:local` 会检查并启动本机抓取服务，在构建缺失或早于源码时重新构建，然后以生产模式启动 Next.js。哔站 sidecar 由轻量监督进程管理，意外退出后会自动重启；主动运行 `stop:local` 时会一并停止监督器和工作进程。并发执行多个启动命令时，后启动的命令会等待前一个完成，避免重复构建和覆盖进程记录。启动器只管理自己记录在 `.local/runtime/` 中的进程，不会结束同端口上的未知进程。浏览器打开 `http://127.0.0.1:3000`；运行日志也位于该目录。停止由此脚本启动的服务可运行 `npm run stop:local`。如果只想调试前端，可使用 `npm run dev`；普通 `dev` 和 `start` 命令默认也只监听回环地址。
+`start:local` 会检查并启动本机抓取服务，在构建缺失或早于源码时重新构建，然后以生产模式启动 Next.js。哔站 sidecar 由轻量监督进程管理，意外退出后会自动重启；主动运行 `stop:local` 时会一并停止监督器和工作进程。并发执行多个启动命令时，后启动的命令会等待前一个完成，避免重复构建和覆盖进程记录。启动器只管理自己记录在 `.local/runtime/` 中的进程，不会结束同端口上的未知进程。默认访问地址为 `http://127.0.0.1:3000`；设置有效的 `APP_PORT` 时使用对应端口。运行日志也位于该目录。停止由此脚本启动的服务可运行 `npm run stop:local`。如果只想调试前端，可使用 `npm run dev`；普通 `dev` 和 `start` 命令默认也只监听回环地址。
+
+### 登录后自动启动与个人数据
+
+Windows 上可安装当前用户的登录启动项：
+
+```powershell
+npm run autostart:install
+```
+
+也可以直接运行 PowerShell 脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-autostart.ps1
+```
+
+安装脚本会在当前用户的 Windows Startup 文件夹创建快捷方式，并立即启动或复用网站。`APP_PORT` 必须是 1-65535 范围内的十进制整数；安装时按当前进程、用户级、计算机级环境变量的顺序读取，未设置时使用 `scripts/local-settings.json` 中的 `appPort`。通过 `APP_PORT` 设置的端口会固定用于本次启动和后续登录；更改端口后重新运行安装命令。默认地址是 `http://127.0.0.1:3000`。启动项不会自动打开浏览器窗口，也不会把服务暴露到局域网。移除自动启动设置运行 `npm run autostart:remove`，或直接运行 `powershell -ExecutionPolicy Bypass -File .\scripts\remove-autostart.ps1`；移除启动项不会删除数据或停止当前服务，停止服务仍运行 `npm run stop:local`。
+
+项目专用个人数据目录为：
+
+```text
+<项目根目录>\.local\personal-data\
+  backups\    # 从网站导出的 JSON v2 备份
+```
+
+运行 `start:local` 时会自动创建该目录。整个 `.local/` 已被 Git 忽略，因此备份不会被提交到仓库。网站的实时数据仍自动保存在当前浏览器配置中的 IndexedDB；电脑重启后，使用同一个浏览器配置并访问同一 origin（协议、主机和端口），例如 `http://127.0.0.1:3000`，数据会继续显示。不同端口、不同主机名、无痕窗口或不同浏览器配置各自拥有独立数据。
+
+要保留可移动的文件备份，可在 Edge/Chrome 的下载设置中把下载位置设为上述 `backups` 目录，再在网站“管理数据”中选择“导出备份”。导出的 `just-follow-feed-YYYY-MM-DD.json` 包含关注名单和视频元数据。更换浏览器配置、清理浏览器数据或迁移电脑后，先打开同一网址，再从“管理数据”选择“导入备份”并确认；导入会替换当前网站数据。备份目录不会被网站自动导入，建议定期导出并另行复制到安全位置。
 
 启动器发现当前 Node.js 不是 24 时会给出警告但继续运行，避免直接中断本机使用。项目仍只在 Node.js 24 LTS 下完成验证；若出现构建或运行异常，请先切换到 Node.js 24。
 

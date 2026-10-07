@@ -12,6 +12,8 @@
     "start": "next start --hostname 127.0.0.1",
     "start:local": "node .\\scripts\\launch-local.mjs",
     "stop:local": "node .\\scripts\\stop-local.mjs",
+    "autostart:install": "powershell -ExecutionPolicy Bypass -File .\\scripts\\install-autostart.ps1",
+    "autostart:remove": "powershell -ExecutionPolicy Bypass -File .\\scripts\\remove-autostart.ps1",
     "check:local": "powershell -ExecutionPolicy Bypass -File .\\scripts\\check-local.ps1",
     "audit:sidecar": "powershell -ExecutionPolicy Bypass -File .\\scripts\\audit-sidecar.ps1",
     "lint": "eslint .",

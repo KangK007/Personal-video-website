@@ -22,7 +22,166 @@ function video(id: string, bvid: string) {
   };
 }
 
+function manualVideo(id: string, videoUrl: string, platform: "bilibili" | "douyin" = "bilibili") {
+  return {
+    ...video(id, "BV1abcdefghi"),
+    platform,
+    videoUrl,
+    title: id,
+    source: "manual" as const,
+  };
+}
+
 describe("feed storage migration", () => {
+  it("rejects Bilibili profile aliases that identify the same UID", () => {
+    const state = {
+      version: 2,
+      creators: [
+        { ...creator, nameSource: "fallback" },
+        { ...creator, id: "creator-alias", profileUrl: "https://www.bilibili.com/space/123456/?spm_id_from=share", nameSource: "fallback" },
+      ],
+      videos: [],
+    };
+
+    expect(migrateFeedState(state)).toBeNull();
+    expect(recoverFeedState(state)?.state.creators).toHaveLength(1);
+  });
+
+  it("reattaches videos to the retained creator when recovery folds profile aliases", () => {
+    const alias = {
+      ...creator,
+      id: "creator-alias",
+      profileUrl: "https://www.bilibili.com/space/123456/?spm_id_from=share",
+      nameSource: "fallback" as const,
+    };
+    const recovered = recoverFeedState({
+      version: 2,
+      creators: [{ ...creator, nameSource: "fallback" }, alias],
+      videos: [
+        video("video-primary", "BV1abcdefghi"),
+        { ...video("video-alias", "BV1klmnopqrs"), creatorId: alias.id },
+      ],
+    });
+
+    expect(recovered?.state.creators).toHaveLength(1);
+    expect(recovered?.state.videos.map(({ id, creatorId }) => ({ id, creatorId }))).toEqual([
+      { id: "sync-bilibili-BV1abcdefghi", creatorId: creator.id },
+      { id: "sync-bilibili-BV1klmnopqrs", creatorId: creator.id },
+    ]);
+  });
+
+  it("keeps a manual video when alias recovery finds the same automatic video", () => {
+    const alias = {
+      ...creator,
+      id: "creator-alias",
+      profileUrl: "https://www.bilibili.com/space/123456/?spm_id_from=share",
+      nameSource: "fallback" as const,
+    };
+    const recovered = recoverFeedState({
+      version: 2,
+      creators: [{ ...creator, nameSource: "fallback" }, alias],
+      videos: [
+        video("sync-video", "BV1abcdefghi"),
+        {
+          ...manualVideo("manual-video", "https://m.bilibili.com/video/BV1abcdefghi?p=1&from=share"),
+          creatorId: alias.id,
+          coverUrl: "https://i0.hdslb.com/example.jpg",
+        },
+      ],
+    });
+
+    expect(recovered?.state.videos).toHaveLength(1);
+    expect(recovered?.state.videos[0]).toMatchObject({
+      id: "manual-video",
+      creatorId: creator.id,
+      source: "manual",
+      coverUrl: "https://i0.hdslb.com/example.jpg",
+    });
+  });
+
+  it("keeps recovered IDs unique when the preferred alias ID belongs to another video", () => {
+    const otherManual = manualVideo("manual-collision", "https://www.bilibili.com/video/BV1klmnopqrs");
+    const aliasManual = manualVideo("manual-collision", "https://m.bilibili.com/video/BV1abcdefghi?p=1&from=share");
+    const recovered = recoverFeedState({
+      version: 2,
+      creators: [{ ...creator, nameSource: "fallback" }],
+      videos: [video("old-sync-id", "BV1abcdefghi"), otherManual, aliasManual],
+    });
+    const recoveredAlias = recovered?.state.videos.find((item) => item.videoUrl.includes("BV1abcdefghi"));
+
+    expect(recovered?.state.videos).toHaveLength(2);
+    expect(recovered?.state.videos.map((item) => item.id)).toEqual(expect.arrayContaining([
+      "manual-collision",
+    ]));
+    expect(recoveredAlias?.source).toBe("manual");
+    expect(recoveredAlias?.id).not.toBe(otherManual.id);
+    expect(recovered && migrateFeedState(recovered.state)).not.toBeNull();
+  });
+
+  it("rejects Douyin profile aliases that identify the same user path", () => {
+    const douyinCreator = {
+      id: "douyin-creator-1",
+      platform: "douyin" as const,
+      profileUrl: "https://www.douyin.com/user/MS4wLjABAAAA",
+      name: "抖音博主",
+      enabled: true,
+    };
+
+    expect(migrateFeedState({
+      version: 2,
+      creators: [
+        { ...douyinCreator, nameSource: "fallback" },
+        { ...douyinCreator, id: "douyin-creator-2", profileUrl: "https://m.iesdouyin.com/user/MS4wLjABAAAA/?from=share", nameSource: "fallback" },
+      ],
+      videos: [],
+    })).toBeNull();
+  });
+
+  it("treats Bilibili host and tracking aliases without p as the first part", () => {
+    for (const query of ["p=1", "p=0", "p=not-a-number"]) {
+      const firstPart = manualVideo("video-1", "https://www.bilibili.com/video/BV1abcdefghi?spm_id_from=share");
+      const aliasPart = manualVideo("video-2", `https://m.bilibili.com/video/BV1abcdefghi?${query}#comments`);
+
+      expect(migrateFeedState({
+        version: 2,
+        creators: [{ ...creator, nameSource: "fallback" }],
+        videos: [firstPart, aliasPart],
+      })).toBeNull();
+    }
+  });
+
+  it("keeps distinct valid Bilibili parts as separate videos", () => {
+    const firstPart = { ...video("video-1", "BV1abcdefghi"), videoUrl: "https://www.bilibili.com/video/BV1abcdefghi" };
+    const secondPart = { ...video("video-2", "BV1abcdefghi"), videoUrl: "https://m.bilibili.com/video/BV1abcdefghi?p=2&spm_id_from=share" };
+
+    expect(migrateFeedState({
+      version: 2,
+      creators: [{ ...creator, nameSource: "fallback" }],
+      videos: [firstPart, secondPart],
+    })?.videos).toHaveLength(2);
+  });
+
+  it("deduplicates Douyin videos by aweme ID across host and tracking aliases", () => {
+    const douyinCreator = {
+      id: "douyin-creator-1",
+      platform: "douyin" as const,
+      profileUrl: "https://www.douyin.com/user/MS4wLjABAAAA",
+      name: "抖音博主",
+      nameSource: "fallback" as const,
+      enabled: true,
+    };
+    const firstVideo = {
+      ...manualVideo("video-1", "https://www.douyin.com/video/7201234567890123456?from=share", "douyin"),
+      creatorId: douyinCreator.id,
+    };
+    const aliasVideo = {
+      ...manualVideo("video-2", "https://m.douyin.com/video/7201234567890123456?modal_id=7201234567890123456", "douyin"),
+      creatorId: douyinCreator.id,
+    };
+
+    expect(migrateFeedState({ version: 2, creators: [douyinCreator], videos: [firstVideo, aliasVideo] })).toBeNull();
+  });
+
   it("migrates a v1 fallback creator to v2 without changing its meaning", () => {
     const migrated = migrateFeedState({ version: 1, creators: [creator], videos: [] });
 

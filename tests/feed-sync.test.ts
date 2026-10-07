@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { buildSyncBatches, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, mergeSyncResponse, type SyncResponse } from "@/lib/feed-sync";
-import { MAX_FEED_NAME_LENGTH, MAX_FEED_TITLE_LENGTH } from "@/lib/feed-storage";
+import { MAX_FEED_NAME_LENGTH, MAX_FEED_TITLE_LENGTH, migrateFeedState } from "@/lib/feed-storage";
 import type { Creator, FeedState, VideoItem } from "@/lib/feed-types";
 
 const creator: Creator = {
@@ -83,6 +83,34 @@ describe("mergeSyncResponse", () => {
     expect(result.videos).toHaveLength(1);
     expect(result.videos[0]).toMatchObject({ id: manual.id, source: "manual", title: manual.title });
     expect(result.videos[0].coverUrl).toBe("https://i0.hdslb.com/example.jpg");
+  });
+
+  it("merges a synchronized video with a manual Bilibili URL alias", () => {
+    const manual = syncedVideo({
+      id: "manual-id",
+      videoUrl: "https://m.bilibili.com/video/BV1same411c7mD?p=1&spm_id_from=share",
+      title: "Manual title",
+      source: "manual",
+    });
+    const result = merge([manual], {
+      videos: [syncedVideo({
+        id: "sync-id",
+        videoUrl: "https://www.bilibili.com/video/BV1same411c7mD",
+        title: "Platform title",
+        coverUrl: "https://i0.hdslb.com/example.jpg",
+      })],
+      results: [{ creatorId: creator.id, status: "success", complete: true, count: 1 }],
+    });
+
+    expect(result.videos).toHaveLength(1);
+    expect(result.videos[0]).toMatchObject({
+      id: "manual-id",
+      videoUrl: manual.videoUrl,
+      title: "Manual title",
+      source: "manual",
+      coverUrl: "https://i0.hdslb.com/example.jpg",
+    });
+    expect(migrateFeedState({ version: 2, creators: [creator], videos: result.videos })).not.toBeNull();
   });
 
   it("retains the old snapshot when a reported video URL is not a platform video page", () => {

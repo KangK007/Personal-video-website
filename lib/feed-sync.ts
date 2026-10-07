@@ -2,6 +2,7 @@
 
 import { parsePublishedAt, sortVideos } from "@/lib/feed-logic";
 import {
+  getFeedVideoIdentityKey,
   isPlatformVideoUrl,
   MAX_FEED_DATE_LENGTH,
   MAX_FEED_DURATION_LENGTH,
@@ -342,7 +343,7 @@ export function mergeSyncResponse(
     if (typeof result.creatorId !== "string") return [];
     const creatorVideos = incomingByCreator.get(result.creatorId) ?? [];
     const uniqueIds = new Set(creatorVideos.map((video) => video.id));
-    const uniqueUrls = new Set(creatorVideos.map((video) => video.videoUrl));
+    const uniqueUrls = new Set(creatorVideos.map((video) => getFeedVideoIdentityKey(video.videoUrl, video.platform)));
     const countMatches = Number.isSafeInteger(result.count)
       && result.count === creatorVideos.length
       && uniqueIds.size === creatorVideos.length
@@ -364,23 +365,26 @@ export function mergeSyncResponse(
     .map((result) => result.creatorId as string);
 
   const retained = state.videos.filter((video) => !snapshotIds.has(video.creatorId) || video.source !== "feed-sync");
-  const byUrl = new Map(retained.map((video) => [video.videoUrl.toLowerCase(), video]));
+  const byIdentity = new Map(retained.map((video) => [
+    getFeedVideoIdentityKey(video.videoUrl, video.platform),
+    video,
+  ]));
   incoming.forEach((video) => {
-    const urlKey = video.videoUrl.toLowerCase();
-    const existing = byUrl.get(urlKey);
+    const identityKey = getFeedVideoIdentityKey(video.videoUrl, video.platform);
+    const existing = byIdentity.get(identityKey);
     if (!existing) {
-      byUrl.set(urlKey, video);
+      byIdentity.set(identityKey, video);
       return;
     }
     if (existing.source === "manual" || existing.source === "public-metadata") {
-      byUrl.set(urlKey, {
+      byIdentity.set(identityKey, {
         ...existing,
         coverUrl: existing.coverUrl || video.coverUrl,
         publishedAt: existing.publishedAt || video.publishedAt,
         duration: existing.duration || video.duration,
       });
     } else {
-      byUrl.set(urlKey, video);
+      byIdentity.set(identityKey, video);
     }
   });
 
@@ -410,7 +414,7 @@ export function mergeSyncResponse(
 
   return {
     creators,
-    videos: Array.from(byUrl.values()),
+    videos: Array.from(byIdentity.values()),
     failedCreatorIds,
     incomingCount: incoming.length,
     succeededCount: completeIds.size,

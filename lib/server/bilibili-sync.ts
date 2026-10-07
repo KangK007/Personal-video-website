@@ -24,6 +24,8 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_SIDECAR_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 700;
 const SIDECAR_HEALTH_TIMEOUT_MS = 2_000;
+const MAX_BILIBILI_PAGES = 1_000;
+const MAX_BILIBILI_VIDEOS = 150_000;
 
 function isLoopbackHost(hostname: string) {
   return hostname === "localhost"
@@ -229,12 +231,20 @@ function getBilibiliPage(
     };
   });
   const page = asRecord(root.page);
+  const hasExplicitSafeInteger = (value: unknown, minimum: number) => {
+    if (typeof value !== "number" && !(typeof value === "string" && value.trim())) return false;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= minimum;
+  };
   return {
     videos,
     rawCount: list.length,
     pageNumber: Number(page.pn),
     pageSize: Number(page.ps),
     total: Number(page.count),
+    hasPageNumber: hasExplicitSafeInteger(page.pn, 1),
+    hasPageSize: hasExplicitSafeInteger(page.ps, 1),
+    hasTotal: hasExplicitSafeInteger(page.count, 0),
     signature: videos.map((video) => video.videoUrl).join("|"),
   };
 }
@@ -254,6 +264,9 @@ async function getAllBilibiliVideos(
   let requestedPage = 1;
 
   while (true) {
+    if (requestedPage > MAX_BILIBILI_PAGES) {
+      throw new Error("哔站分页超过安全上限，未完整同步");
+    }
     throwIfAborted(signal);
     const payload = await fetchSidecarJson(
       baseUrl,
@@ -262,23 +275,19 @@ async function getAllBilibiliVideos(
       signal,
     );
     const page = getBilibiliPage(payload, creator, syncedAt);
-    const reportedPage = Number.isInteger(page.pageNumber) && page.pageNumber > 0
-      ? page.pageNumber
-      : undefined;
-    if (reportedPage !== undefined && reportedPage !== requestedPage) {
+    if (!page.hasPageNumber || !page.hasPageSize || !page.hasTotal) {
+      throw new Error("哔站分页元数据不完整，未完整同步");
+    }
+    if (page.pageNumber !== requestedPage) {
       throw new Error("哔站分页页码与请求不一致，未完整同步");
     }
-    const reportedTotal = Number.isSafeInteger(page.total) && page.total >= 0
-      ? page.total
-      : undefined;
-    if (reportedTotal !== undefined) {
-      if (expectedTotal !== undefined && reportedTotal !== expectedTotal) {
-        throw new Error("哔站投稿总数在同步过程中发生变化，未完整同步");
-      }
-      expectedTotal = reportedTotal;
+    const reportedTotal = page.total;
+    if (expectedTotal !== undefined && reportedTotal !== expectedTotal) {
+      throw new Error("哔站投稿总数在同步过程中发生变化，未完整同步");
     }
+    expectedTotal = reportedTotal;
     if (page.rawCount === 0) {
-      if (expectedTotal !== undefined && videos.size !== expectedTotal) {
+      if (expectedTotal !== 0 || videos.size !== expectedTotal) {
         throw new Error("哔站分页提前结束，未读取全部投稿");
       }
       break;
@@ -288,18 +297,17 @@ async function getAllBilibiliVideos(
     }
     seenPages.add(page.signature);
     page.videos.forEach((video) => videos.set(video.videoUrl, video));
+    if (videos.size > MAX_BILIBILI_VIDEOS) {
+      throw new Error("哔站投稿超过安全上限，未完整同步");
+    }
 
-    const pageNumber = reportedPage ?? requestedPage;
-    const pageSize = Number.isInteger(page.pageSize) && page.pageSize > 0
-      ? page.pageSize
-      : page.rawCount;
-    if (expectedTotal !== undefined && pageNumber * pageSize >= expectedTotal) {
-      if (videos.size !== expectedTotal) {
+    const pageNumber = page.pageNumber;
+    if (pageNumber * page.pageSize >= reportedTotal) {
+      if (videos.size !== reportedTotal) {
         throw new Error("哔站返回的投稿数量与总数不一致，未完整同步");
       }
       break;
     }
-    if (expectedTotal === undefined && page.rawCount < pageSize) break;
     requestedPage = pageNumber + 1;
   }
 

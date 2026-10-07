@@ -277,11 +277,20 @@ async function runSync(request: Request, creators: CreatorInput[]) {
       if (creator.platform === "douyin" && hasAnotherDouyinCreator && !douyinCircuitOpen) {
         const delay = DOUYIN_CREATOR_COOLDOWN_MIN_MS
           + Math.floor(Math.random() * (DOUYIN_CREATOR_COOLDOWN_RANGE_MS + 1));
-        await waitWithSignal(delay, request.signal);
+        try {
+          await waitWithSignal(delay, request.signal);
+        } catch (error) {
+          if (!request.signal.aborted) throw error;
+          break;
+        }
       }
     }
   } finally {
-    await douyinBrowser?.close();
+    try {
+      await douyinBrowser?.close();
+    } catch {
+      // Browser cleanup must not replace the synchronization result.
+    }
   }
 
   if (request.signal.aborted) {
