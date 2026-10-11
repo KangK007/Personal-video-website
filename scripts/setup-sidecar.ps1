@@ -13,7 +13,9 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $localRoot = Join-Path $projectRoot ".local"
 $sidecarRoot = Join-Path $localRoot "Douyin_TikTok_Download_API"
-$venvPython = Join-Path $sidecarRoot ".venv\Scripts\python.exe"
+$venvDirectory = Join-Path $sidecarRoot ".venv"
+$venvPython = Join-Path $venvDirectory "Scripts\python.exe"
+. (Join-Path $PSScriptRoot "sidecar-python.ps1")
 $repositoryUrl = "https://github.com/Evil0ctal/Douyin_TikTok_Download_API.git"
 $sidecarCommit = "42784ffc83a72a516bfe952153ad7e2a3998d16c"
 $settings = Get-Content -Raw (Join-Path $PSScriptRoot "local-settings.json") | ConvertFrom-Json
@@ -149,10 +151,6 @@ function Get-CookieText([string]$path, [string]$prompt) {
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
   throw "Git was not found. Install Git for Windows first."
 }
-if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-  throw "Python was not found. Install Python 3.11 first."
-}
-
 New-Item -ItemType Directory -Path $localRoot -Force | Out-Null
 if (-not (Test-Path -LiteralPath (Join-Path $sidecarRoot ".git"))) {
   if (Test-Path -LiteralPath $sidecarRoot) {
@@ -173,24 +171,37 @@ if ($currentSidecarCommit -ne $sidecarCommit) {
   throw "Unsupported sidecar revision $currentSidecarCommit. Expected $sidecarCommit."
 }
 
-if (-not $SkipInstall) {
-  if (-not (Test-Path -LiteralPath $venvPython)) {
-    $pythonVersion = (python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
-    Assert-LastCommand "Could not identify the Python version."
-    if ($pythonVersion -ne "3.11") {
-      throw "Pinned sidecar v4 requires Python 3.11. Found Python $pythonVersion."
-    }
-    Write-Host "Creating an isolated Python environment..."
-    python -m venv (Join-Path $sidecarRoot ".venv")
-    Assert-LastCommand "Could not create the Python virtual environment."
+if (-not (Test-SidecarPython $venvPython)) {
+  if ($SkipInstall) {
+    throw "The sidecar Python 3.11 environment is missing or cannot run. Retry without -SkipInstall to rebuild it."
   }
+  $basePython = Get-Python311
+  if (Test-Path -LiteralPath $venvDirectory) {
+    $venvItem = Get-Item -LiteralPath $venvDirectory -Force
+    $expectedPath = [System.IO.Path]::GetFullPath((Join-Path $sidecarRoot ".venv"))
+    if (-not $venvItem.PSIsContainer `
+      -or ($venvItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) `
+      -or -not [string]::Equals($venvItem.FullName, $expectedPath, [StringComparison]::OrdinalIgnoreCase) `
+      -or -not (Test-Path -LiteralPath (Join-Path $venvDirectory "pyvenv.cfg") -PathType Leaf)) {
+      throw "The existing .venv is not a regular Python virtual environment. Inspect it before retrying."
+    }
+    Write-Host "Replacing the unusable sidecar Python environment..."
+    Remove-Item -LiteralPath $venvItem.FullName -Recurse -Force
+  }
+  Write-Host "Creating an isolated Python 3.11 environment..."
+  & $basePython -m venv $venvDirectory
+  Assert-LastCommand "Could not create the Python virtual environment."
+  if (-not (Test-SidecarPython $venvPython)) {
+    throw "The new sidecar environment cannot run Python 3.11."
+  }
+}
+
+if (-not $SkipInstall) {
   Write-Host "Installing sidecar dependencies. This can take a few minutes..."
   & $venvPython -m pip install --upgrade pip
   Assert-LastCommand "Could not update pip."
   & $venvPython -m pip install -r (Join-Path $sidecarRoot "requirements.txt")
   Assert-LastCommand "Could not install the sidecar dependencies."
-} elseif (-not (Test-Path -LiteralPath $venvPython)) {
-  throw "The sidecar is not installed. Do not use -SkipInstall for the first run."
 }
 
 # The validated security overlay is mandatory even when the slower base install is skipped.

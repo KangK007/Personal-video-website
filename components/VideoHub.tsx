@@ -208,7 +208,7 @@ function VideoCover({ video }: { video: VideoItem }) {
 function VideoCard({ video, creator, view, onDelete }: { video: VideoItem; creator: Creator; view: VideoView; onDelete?: (video: VideoItem) => void }) {
   const label = platformLabel(video.platform);
   return (
-    <article className={`video-card ${view === "list" ? "is-list" : ""}`}>
+    <article className={`video-card ${platformClass(video.platform)} ${view === "list" ? "is-list" : ""}`}>
       <a className="cover-wrap" href={video.videoUrl} target="_blank" rel="noreferrer" aria-label={`在${label}打开：${video.title}`}>
         <VideoCover video={video} />
         {video.duration ? <span className="duration">{video.duration}</span> : null}
@@ -226,13 +226,19 @@ function VideoCard({ video, creator, view, onDelete }: { video: VideoItem; creat
 }
 
 function SearchBox({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder: string }) {
+  const inputId = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const clearSearch = () => {
+    onChange("");
+    inputRef.current?.focus();
+  };
   return (
-    <label className="search-box">
+    <div className="search-box">
       <MagnifyingGlass size={18} aria-hidden="true" />
-      <span className="visually-hidden">{placeholder}</span>
-      <input value={value} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape" && value) { event.preventDefault(); onChange(""); } }} placeholder={placeholder} type="search" />
-      {value ? <button type="button" className="search-clear" onClick={() => onChange("")} aria-label="清除搜索" title="清除搜索"><XCircle size={18} aria-hidden="true" /></button> : null}
-    </label>
+      <label className="visually-hidden" htmlFor={inputId}>{placeholder}</label>
+      <input ref={inputRef} id={inputId} value={value} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape" && value) { event.preventDefault(); clearSearch(); } }} placeholder={placeholder} type="search" />
+      {value ? <button type="button" className="search-clear" onClick={clearSearch} aria-label="清除搜索" title="清除搜索"><XCircle size={18} aria-hidden="true" /></button> : null}
+    </div>
   );
 }
 
@@ -250,7 +256,7 @@ function StatusTabs({ value, onChange, counts }: { value: CreatorStatusFilter; o
 }
 
 function LoadingState() {
-  return <div className="loading-state" role="status" aria-label="正在读取本地数据"><span className="loading-bar" /><span className="loading-bar short" /><div className="loading-grid">{Array.from({ length: 6 }, (_, index) => <span key={index} />)}</div></div>;
+  return <div className="loading-state" role="status"><span className="visually-hidden">正在读取本地数据</span><div aria-hidden="true"><span className="loading-bar" /><span className="loading-bar short" /><div className="loading-grid">{Array.from({ length: 6 }, (_, index) => <span key={index} />)}</div></div></div>;
 }
 
 function StorageRecovery({ message, onRetry, onImport }: { message: string; onRetry: () => void; onImport: () => void }) {
@@ -273,7 +279,15 @@ function EmptyState({ kind, onAdd, onSync, onClear, query, platform }: { kind: E
     "no-following-match": ["没有匹配的关注博主", `当前筛选${query ? `“${query}”` : ""}下没有结果。`],
   };
   const [title, description] = copy[kind];
-  return <div className="empty-state"><span className="empty-icon" aria-hidden="true"><FilmSlate size={30} weight="duotone" /></span><h3>{title}</h3><p>{description}</p><div className="empty-actions">{kind === "no-creators" ? <button className="primary-button" type="button" onClick={onAdd}><Plus size={18} aria-hidden="true" />添加博主</button> : null}{kind === "no-recent" || kind === "no-platform" || kind === "no-videos" ? <button className="secondary-button" type="button" onClick={onSync}><ArrowsClockwise size={18} aria-hidden="true" />同步关注流</button> : null}{(kind === "no-match" || kind === "no-following-match") && onClear ? <button className="secondary-button" type="button" onClick={onClear}>清除筛选</button> : null}</div></div>;
+  const icons: Record<EmptyKind, ReactNode> = {
+    "no-creators": <UserCirclePlus size={30} weight="duotone" />,
+    "no-recent": <CalendarBlank size={30} weight="duotone" />,
+    "no-platform": <SlidersHorizontal size={30} weight="duotone" />,
+    "no-videos": <FilmSlate size={30} weight="duotone" />,
+    "no-match": <MagnifyingGlass size={30} weight="duotone" />,
+    "no-following-match": <MagnifyingGlass size={30} weight="duotone" />,
+  };
+  return <div className={`empty-state empty-${kind}`}><span className="empty-icon" aria-hidden="true">{icons[kind]}</span><h3>{title}</h3><p>{description}</p><div className="empty-actions">{kind === "no-creators" ? <button className="primary-button" type="button" onClick={onAdd}><Plus size={18} aria-hidden="true" />添加博主</button> : null}{kind === "no-recent" || kind === "no-platform" || kind === "no-videos" ? <button className="secondary-button" type="button" onClick={onSync}><ArrowsClockwise size={18} aria-hidden="true" />同步关注流</button> : null}{(kind === "no-match" || kind === "no-following-match") && onClear ? <button className="secondary-button" type="button" onClick={onClear}>清除筛选</button> : null}</div></div>;
 }
 
 function PageHeader({ eyebrow, title, subtitle, stat, action }: { eyebrow: string; title: string; subtitle: string; stat: string; action?: ReactNode }) {
@@ -295,6 +309,7 @@ function NoticeHost() {
 
 function CreatorModal({ close, onAdd, existingUrls }: { close: () => void; onAdd: (items: CreatorDraft[]) => string | null; existingUrls: Set<string> }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const errorId = useId();
   const [value, setValue] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState("");
@@ -314,21 +329,29 @@ function CreatorModal({ close, onAdd, existingUrls }: { close: () => void; onAdd
     });
     return { duplicateCount, newCount };
   }, [existingUrls, parsed.duplicateLines.length, parsed.entries]);
+  const noNewCreators = submitted && Boolean(value.trim()) && !hasParseError && !importSummary.newCount;
+  const hasFieldError = hasParseError || (submitted && !value.trim()) || noNewCreators || Boolean(submitError);
   const submit = (event: FormEvent) => {
     event.preventDefault();
     setSubmitted(true);
     setSubmitError("");
-    if (!value.trim() || hasParseError || !importSummary.newCount) return;
+    if (!value.trim() || hasParseError || !importSummary.newCount) { textareaRef.current?.focus(); return; }
     const error = onAdd(parsed.entries.filter((entry) => !existingUrls.has(getFeedCreatorIdentityKey(entry.profileUrl, entry.platform))));
-    if (error) { setSubmitError(error); return; }
+    if (error) { setSubmitError(error); textareaRef.current?.focus(); return; }
     close();
   };
-  return <Modal title="添加关注博主" description="逐行粘贴主页链接，可在链接前后写昵称。" onClose={close} initialFocusRef={textareaRef} className="creator-modal"><form onSubmit={submit}><label className="field-label" htmlFor="creator-lines">主页名单</label><textarea ref={textareaRef} id="creator-lines" className="creator-textarea" value={value} onChange={(event) => { setValue(event.target.value); setSubmitted(false); setSubmitError(""); }} placeholder={'https://www.douyin.com/user/xxx\n哔站作者\thttps://space.bilibili.com/123'} rows={8} /><div className="import-summary"><span><strong>{parsed.entries.length}</strong> 条有效</span><span><strong>{importSummary.duplicateCount}</strong> 条重复</span><span className={parsed.invalidLines.length ? "has-error" : ""}><strong>{parsed.invalidLines.length}</strong> 行无效</span><span><strong>{importSummary.newCount}</strong> 位将新增</span></div>{parsed.limitExceeded ? <p className="field-error" role="alert">单次最多导入 {MAX_CREATOR_IMPORT_LINES.toLocaleString("zh-CN")} 行，请拆分名单后重试。</p> : null}{parsed.invalidLines.length ? <p className="field-error" role="alert">第 {parsed.invalidLines.join(", ")} 行无法识别。修正后才能确认导入。</p> : null}{submitted && !value.trim() ? <p className="field-error" role="alert">请先粘贴至少一条主页链接。</p> : null}{submitError ? <p className="field-error" role="alert">{submitError}</p> : null}<div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit" disabled={!importSummary.newCount || hasParseError}><UserCirclePlus size={18} aria-hidden="true" />确认添加</button></div></form></Modal>;
+  return <Modal title="添加关注博主" description="逐行粘贴主页链接，可在链接前后写昵称。" onClose={close} initialFocusRef={textareaRef} className="creator-modal"><form onSubmit={submit}><label className="field-label" htmlFor="creator-lines">主页名单</label><textarea ref={textareaRef} id="creator-lines" className="creator-textarea" value={value} onChange={(event) => { setValue(event.target.value); setSubmitted(false); setSubmitError(""); }} placeholder={'https://www.douyin.com/user/xxx\n哔站作者\thttps://space.bilibili.com/123'} rows={8} aria-invalid={hasFieldError} aria-describedby={hasFieldError ? errorId : undefined} /><div className="import-summary"><span><strong>{parsed.entries.length}</strong> 条有效</span><span><strong>{importSummary.duplicateCount}</strong> 条重复</span><span className={parsed.invalidLines.length ? "has-error" : ""}><strong>{parsed.invalidLines.length}</strong> 行无效</span><span><strong>{importSummary.newCount}</strong> 位将新增</span></div>{hasFieldError ? <div id={errorId}>{parsed.limitExceeded ? <p className="field-error" role="alert">单次最多导入 {MAX_CREATOR_IMPORT_LINES.toLocaleString("zh-CN")} 行，请拆分名单后重试。</p> : null}{parsed.invalidLines.length ? <p className="field-error" role="alert">第 {parsed.invalidLines.join(", ")} 行无法识别。修正后才能确认导入。</p> : null}{submitted && !value.trim() ? <p className="field-error" role="alert">请先粘贴至少一条主页链接。</p> : null}{noNewCreators ? <p className="field-error" role="alert">名单中没有可添加的新博主，请检查重复链接。</p> : null}{submitError ? <p className="field-error" role="alert">{submitError}</p> : null}</div> : null}<div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit"><UserCirclePlus size={18} aria-hidden="true" />确认添加</button></div></form></Modal>;
 }
 
 function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (video: VideoItem) => boolean; creators: Creator[] }) {
   const metadataMessageId = useId();
+  const formErrorId = useId();
+  const creatorErrorId = useId();
   const metadataControllerRef = useRef<AbortController | null>(null);
+  const urlRef = useRef<HTMLInputElement>(null);
+  const titleRef = useRef<HTMLInputElement>(null);
+  const coverRef = useRef<HTMLInputElement>(null);
+  const creatorErrorRef = useRef<HTMLParagraphElement>(null);
   const [url, setUrl] = useState("");
   const [title, setTitle] = useState("");
   const [coverUrl, setCoverUrl] = useState("");
@@ -336,7 +359,7 @@ function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (v
   const [creatorId, setCreatorId] = useState("");
   const [metadataState, setMetadataState] = useState<"idle" | "loading" | "error">("idle");
   const [metadataMessage, setMetadataMessage] = useState("");
-  const [formError, setFormError] = useState("");
+  const [formError, setFormError] = useState<{ field: "url" | "title" | "cover"; message: string } | null>(null);
   useEffect(() => () => metadataControllerRef.current?.abort(), []);
   const platform = detectPlatform(url);
   const eligibleCreators = useMemo(
@@ -346,8 +369,11 @@ function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (v
   const selectedCreator = eligibleCreators.find((creator) => creator.id === creatorId)
     ?? eligibleCreators.find((creator) => creator.enabled)
     ?? eligibleCreators[0];
+  const creatorError = !creators.length ? "请先添加关注博主，再保存视频。"
+    : platform && !eligibleCreators.length ? `关注列表中没有${platformLabel(platform)}博主，无法保存归属关系。` : "";
   const fetchMetadata = async () => {
-    if (!platform) { setMetadataState("error"); setMetadataMessage("请先输入抖音或哔站公开链接。"); return; }
+    setFormError(null);
+    if (!platform) { setMetadataState("error"); setMetadataMessage("请先输入抖音或哔站公开链接。"); urlRef.current?.focus(); return; }
     metadataControllerRef.current?.abort();
     const controller = new AbortController();
     metadataControllerRef.current = controller;
@@ -373,17 +399,19 @@ function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (v
   };
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!platform || !title.trim() || !selectedCreator) return;
+    if (!platform) { setFormError({ field: "url", message: "请先输入抖音或哔站公开链接。" }); urlRef.current?.focus(); return; }
+    if (!title.trim()) { setFormError({ field: "title", message: "请填写视频标题。" }); titleRef.current?.focus(); return; }
+    if (!selectedCreator) { creatorErrorRef.current?.focus(); return; }
     const videoUrl = normalizeUrl(url);
     const normalizedCoverUrl = coverUrl.trim() ? normalizeUrl(coverUrl) : "";
-    if (videoUrl.length > MAX_FEED_URL_LENGTH) { setFormError(`视频链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。`); return; }
-    if (title.trim().length > MAX_FEED_TITLE_LENGTH) { setFormError(`标题最多 ${MAX_FEED_TITLE_LENGTH.toLocaleString("zh-CN")} 个字符。`); return; }
-    if (normalizedCoverUrl.length > MAX_FEED_URL_LENGTH) { setFormError(`封面链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。`); return; }
-    setFormError("");
+    if (videoUrl.length > MAX_FEED_URL_LENGTH) { setFormError({ field: "url", message: `视频链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。` }); urlRef.current?.focus(); return; }
+    if (title.trim().length > MAX_FEED_TITLE_LENGTH) { setFormError({ field: "title", message: `标题最多 ${MAX_FEED_TITLE_LENGTH.toLocaleString("zh-CN")} 个字符。` }); titleRef.current?.focus(); return; }
+    if (normalizedCoverUrl.length > MAX_FEED_URL_LENGTH) { setFormError({ field: "cover", message: `封面链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。` }); coverRef.current?.focus(); return; }
+    setFormError(null);
     const saved = onSave({ id: makeId("manual"), platform, videoUrl, creatorId: selectedCreator.id, title: title.trim(), ...(normalizedCoverUrl ? { coverUrl: normalizedCoverUrl } : {}), ...(publishedAt ? { publishedAt } : {}), source: "manual", createdAt: new Date().toISOString() });
     if (saved) close();
   };
-  return <Modal title="保存一个视频" description="保留原站链接和少量公开元数据，视频仍在原平台播放。" onClose={close} className="video-modal"><form onSubmit={submit}><label className="field-label" htmlFor="video-url">视频链接</label><div className="field-with-action"><input id="video-url" type="url" value={url} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { metadataControllerRef.current?.abort(); metadataControllerRef.current = null; setUrl(event.target.value); setMetadataState("idle"); setMetadataMessage(""); setFormError(""); }} placeholder="https://www.bilibili.com/video/BV..." aria-describedby={metadataMessage ? metadataMessageId : undefined} aria-invalid={metadataState === "error"} required /><button className="secondary-button" type="button" onClick={() => void fetchMetadata()} disabled={metadataState === "loading"}>{metadataState === "loading" ? <CircleNotch className="spin" size={17} aria-hidden="true" /> : <MagnifyingGlass size={17} aria-hidden="true" />}读取信息</button></div>{metadataMessage ? <p id={metadataMessageId} className={`field-hint ${metadataState === "error" ? "has-error" : ""}`} role={metadataState === "error" ? "alert" : "status"}>{metadataMessage}</p> : null}<label className="field-label" htmlFor="video-title">标题</label><input id="video-title" value={title} maxLength={MAX_FEED_TITLE_LENGTH} onChange={(event) => { setTitle(event.target.value); setFormError(""); }} placeholder="视频标题" required /><label className="field-label" htmlFor="video-creator">归属博主</label><select id="video-creator" value={selectedCreator?.id ?? ""} onChange={(event) => setCreatorId(event.target.value)} disabled={!eligibleCreators.length}><option value="">选择同平台关注博主</option>{eligibleCreators.map((creator) => <option key={creator.id} value={creator.id}>{creator.name} · {platformLabel(creator.platform)}</option>)}</select>{!creators.length ? <p className="field-error" role="alert">请先添加关注博主，再保存视频。</p> : platform && !eligibleCreators.length ? <p className="field-error" role="alert">关注列表中没有{platformLabel(platform)}博主，无法保存归属关系。</p> : null}<div className="field-grid"><div><label className="field-label" htmlFor="video-cover">封面链接（可选）</label><input id="video-cover" type="url" value={coverUrl} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { setCoverUrl(event.target.value); setFormError(""); }} placeholder="https://..." /></div><div><label className="field-label" htmlFor="video-date">发布时间（可选）</label><input id="video-date" type="date" value={publishedAt} onChange={(event) => setPublishedAt(event.target.value)} /></div></div>{formError ? <p className="field-error" role="alert">{formError}</p> : null}<div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit" disabled={!platform || !title.trim() || !selectedCreator}><ListPlus size={18} aria-hidden="true" />保存视频</button></div></form></Modal>;
+  return <Modal title="保存一个视频" description="保留原站链接和少量公开元数据，视频仍在原平台播放。" onClose={close} initialFocusRef={urlRef} className="video-modal"><form onSubmit={submit}><label className="field-label" htmlFor="video-url">视频链接</label><div className="field-with-action"><input ref={urlRef} id="video-url" type="url" value={url} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { metadataControllerRef.current?.abort(); metadataControllerRef.current = null; setUrl(event.target.value); setMetadataState("idle"); setMetadataMessage(""); setFormError(null); }} placeholder="https://www.bilibili.com/video/BV..." aria-describedby={[metadataMessage ? metadataMessageId : "", formError?.field === "url" ? formErrorId : ""].filter(Boolean).join(" ") || undefined} aria-invalid={(metadataState === "error" && !platform) || formError?.field === "url"} required /><button className="secondary-button" type="button" onClick={() => void fetchMetadata()} disabled={metadataState === "loading"}>{metadataState === "loading" ? <CircleNotch className="spin" size={17} aria-hidden="true" /> : <MagnifyingGlass size={17} aria-hidden="true" />}读取信息</button></div>{metadataMessage ? <p id={metadataMessageId} className={`field-hint ${metadataState === "error" ? "has-error" : ""}`} role={metadataState === "error" ? "alert" : "status"}>{metadataMessage}</p> : null}{formError?.field === "url" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}<label className="field-label" htmlFor="video-title">标题</label><input ref={titleRef} id="video-title" value={title} maxLength={MAX_FEED_TITLE_LENGTH} onChange={(event) => { setTitle(event.target.value); setFormError(null); }} placeholder="视频标题" aria-invalid={formError?.field === "title"} aria-describedby={formError?.field === "title" ? formErrorId : undefined} required />{formError?.field === "title" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}<label className="field-label" htmlFor="video-creator">归属博主</label><select id="video-creator" value={selectedCreator?.id ?? ""} onChange={(event) => setCreatorId(event.target.value)} disabled={!eligibleCreators.length} aria-describedby={creatorError ? creatorErrorId : undefined}><option value="">选择同平台关注博主</option>{eligibleCreators.map((creator) => <option key={creator.id} value={creator.id}>{creator.name} · {platformLabel(creator.platform)}</option>)}</select>{creatorError ? <p ref={creatorErrorRef} id={creatorErrorId} className="field-error" role="alert" tabIndex={-1}>{creatorError}</p> : null}<div className="field-grid"><div><label className="field-label" htmlFor="video-cover">封面链接（可选）</label><input ref={coverRef} id="video-cover" type="url" value={coverUrl} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { setCoverUrl(event.target.value); setFormError(null); }} placeholder="https://..." aria-invalid={formError?.field === "cover"} aria-describedby={formError?.field === "cover" ? formErrorId : undefined} />{formError?.field === "cover" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}</div><div><label className="field-label" htmlFor="video-date">发布时间（可选）</label><input id="video-date" type="date" value={publishedAt} onChange={(event) => setPublishedAt(event.target.value)} /></div></div><div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit"><ListPlus size={18} aria-hidden="true" />保存视频</button></div></form></Modal>;
 }
 
 function ConfirmModal({ title, description, confirmLabel, onClose, onConfirm }: { title: string; description: string; confirmLabel: string; onClose: () => void; onConfirm: () => void }) {
@@ -401,7 +429,7 @@ function SettingsPanel({ close, onExport, onImport, onClear }: { close: () => vo
 }
 
 function PageFrame({ active, children, openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: { active: HubView; children: ReactNode } & FrameProps) {
-  const { creators, videos, dataAvailable, storageStatus, storageError, retryHydrate, retryPersist, syncStatus, syncFeed } = useFeed();
+  const { creators, videos, dataAvailable, storageStatus, storageError, isSaving, retryHydrate, retryPersist, syncStatus, syncFeed } = useFeed();
   const [recentNow, setRecentNow] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setRecentNow(Date.now()), 60_000); return () => window.clearInterval(timer); }, []);
   const storageUnavailable = storageStatus === "read-error" || storageStatus === "write-error" || storageStatus === "conflict";
@@ -411,7 +439,8 @@ function PageFrame({ active, children, openCreator, openVideo, settingsOpen, set
   const recentCount = useMemo(() => videos.filter((video) => enabledIds.has(video.creatorId) && isRecentVideo(video, recentNow)).length, [enabledIds, recentNow, videos]);
   const storageNotice = storageError ? <div className="storage-banner" role="alert"><Warning size={18} aria-hidden="true" /><span>{storageError}</span><button className="text-button" type="button" onClick={storageReadError ? retryHydrate : retryPersist}>{storageReadError ? "重试读取" : storageStatus === "conflict" ? "导出后确认覆盖" : "重试保存"}</button></div> : null;
   const storageAction = storageReadError ? retryHydrate : retryPersist;
-  return <div className="app-shell"><a className="skip-link" href="#main-content">跳到主要内容</a><aside className="sidebar" aria-label="侧边导航"><div className="brand-lockup"><span className="brand-symbol" aria-hidden="true"><FilmSlate size={23} weight="duotone" /></span><div><strong>只看关注</strong><span>个人视频收件箱</span></div></div><div className="sidebar-section-label">浏览</div><nav className="main-nav" aria-label="主导航"><Link className={active === "recent" ? "nav-item is-active" : "nav-item"} aria-current={active === "recent" ? "page" : undefined} href="/"><span><CalendarBlank size={18} aria-hidden="true" />最近更新</span><b>{formatCount(recentCount)}</b></Link><Link className={active === "following" ? "nav-item is-active" : "nav-item"} aria-current={active === "following" ? "page" : undefined} href="/following"><span><UserCirclePlus size={18} aria-hidden="true" />关注列表</span><b>{formatCount(creators.length)}</b></Link></nav><div className="sidebar-divider" /><button className="sidebar-action" type="button" onClick={openCreator} disabled={!dataReady}><UserCirclePlus size={18} aria-hidden="true" />添加博主</button><button className="sidebar-action" type="button" onClick={openVideo} disabled={!dataReady}><ListPlus size={18} aria-hidden="true" />保存一个视频</button><div className="sidebar-spacer" /><div className="local-note"><Info size={17} aria-hidden="true" /><p>数据只保存在此浏览器。</p></div><button className="sidebar-settings" type="button" onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen}><GearSix size={18} aria-hidden="true" />数据与设置</button></aside><div className="main-column"><header className="topbar"><div className="mobile-brand"><span className="brand-symbol" aria-hidden="true"><FilmSlate size={20} /></span><strong>只看关注</strong></div><div className={`topbar-status sync-status-${syncStatus}`} aria-live="polite"><span className="status-dot" aria-hidden="true" />{syncStatus === "loading" ? "同步中" : syncStatus === "success" ? "已同步" : syncStatus === "partial" ? "部分完成" : syncStatus === "error" ? "同步失败" : "本地保存"}</div><div className="topbar-actions"><button className="secondary-button sync-button" type="button" onClick={() => void syncFeed()} disabled={!dataReady || syncStatus === "loading"} aria-label="同步关注流" title="同步关注流"><ArrowsClockwise size={18} aria-hidden="true" /><span>同步关注流</span></button><button className="secondary-button add-topbar" type="button" onClick={openCreator} disabled={!dataReady}><Plus size={18} aria-hidden="true" /><span>添加博主</span></button><button className="primary-button save-topbar" type="button" onClick={openVideo} disabled={!dataReady}><ListPlus size={18} aria-hidden="true" /><span>保存视频</span></button><button className="mobile-settings-button icon-button" type="button" onClick={() => setSettingsOpen(!settingsOpen)} aria-label="打开数据与设置" aria-expanded={settingsOpen}><GearSix size={20} aria-hidden="true" /></button></div></header>{storageNotice}<SyncProgress compact /><main id="main-content" tabIndex={-1} className="content-wrap">{storageUnavailable ? storageReadError || !dataAvailable ? <StorageRecovery message={storageError || "请重试或导入备份。"} onRetry={retryHydrate} onImport={onImport} /> : <StorageWriteRecovery conflict={storageStatus === "conflict"} message={storageError || "请先导出备份，再重试保存。"} onRetry={storageAction} onExport={onExport} /> : children}</main></div><nav className="mobile-bottom-nav" aria-label="移动端主导航"><Link className={active === "recent" ? "is-active" : ""} aria-current={active === "recent" ? "page" : undefined} href="/"><CalendarBlank size={20} aria-hidden="true" /><span>最近更新</span></Link><Link className={active === "following" ? "is-active" : ""} aria-current={active === "following" ? "page" : undefined} href="/following"><UserCirclePlus size={20} aria-hidden="true" /><span>关注列表</span></Link></nav>{settingsOpen ? <SettingsPanel close={() => setSettingsOpen(false)} onExport={onExport} onImport={onImport} onClear={onClear} /> : null}<NoticeHost /></div>;
+  const statusLabel = storageUnavailable ? "保存失败" : syncStatus === "loading" ? "同步中" : isSaving ? "保存中" : syncStatus === "success" ? "已同步" : syncStatus === "partial" ? "部分完成" : syncStatus === "error" ? "同步失败" : "本地保存";
+  return <div className="app-shell"><a className="skip-link" href="#main-content">跳到主要内容</a><aside className="sidebar" aria-label="侧边导航"><div className="brand-lockup"><span className="brand-symbol" aria-hidden="true"><FilmSlate size={23} weight="duotone" /></span><div><strong>只看关注</strong><span>个人视频收件箱</span></div></div><div className="sidebar-section-label">浏览</div><nav className="main-nav" aria-label="主导航"><Link className={active === "recent" ? "nav-item is-active" : "nav-item"} aria-current={active === "recent" ? "page" : undefined} href="/"><span><CalendarBlank size={18} aria-hidden="true" />最近更新</span><b>{formatCount(recentCount)}</b></Link><Link className={active === "following" ? "nav-item is-active" : "nav-item"} aria-current={active === "following" ? "page" : undefined} href="/following"><span><UserCirclePlus size={18} aria-hidden="true" />关注列表</span><b>{formatCount(creators.length)}</b></Link></nav><div className="sidebar-divider" /><button className="sidebar-action" type="button" onClick={openCreator} disabled={!dataReady}><UserCirclePlus size={18} aria-hidden="true" />添加博主</button><button className="sidebar-action" type="button" onClick={openVideo} disabled={!dataReady}><ListPlus size={18} aria-hidden="true" />保存一个视频</button><div className="sidebar-spacer" /><div className="local-note"><Info size={17} aria-hidden="true" /><p>数据只保存在此浏览器。</p></div><button className="sidebar-settings" type="button" onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen}><GearSix size={18} aria-hidden="true" />数据与设置</button></aside><div className="main-column"><header className="topbar"><div className="mobile-brand"><span className="brand-symbol" aria-hidden="true"><FilmSlate size={20} /></span><strong>只看关注</strong></div><div className={`topbar-status sync-status-${storageUnavailable ? "error" : syncStatus === "loading" || isSaving ? "loading" : syncStatus}`} aria-live="polite"><span className="status-dot" aria-hidden="true" />{statusLabel}</div><div className="topbar-actions"><button className="secondary-button sync-button" type="button" onClick={() => void syncFeed()} disabled={!dataReady || syncStatus === "loading"} aria-label="同步关注流" title="同步关注流"><ArrowsClockwise size={18} aria-hidden="true" /><span>同步关注流</span></button><button className="secondary-button add-topbar" type="button" onClick={openCreator} disabled={!dataReady}><Plus size={18} aria-hidden="true" /><span>添加博主</span></button><button className="primary-button save-topbar" type="button" onClick={openVideo} disabled={!dataReady}><ListPlus size={18} aria-hidden="true" /><span>保存视频</span></button><button className="mobile-settings-button icon-button" type="button" onClick={() => setSettingsOpen(!settingsOpen)} aria-label="打开数据与设置" aria-expanded={settingsOpen}><GearSix size={20} aria-hidden="true" /></button></div></header>{storageNotice}<SyncProgress compact /><main id="main-content" tabIndex={-1} className="content-wrap">{storageUnavailable ? storageReadError || !dataAvailable ? <StorageRecovery message={storageError || "请重试或导入备份。"} onRetry={retryHydrate} onImport={onImport} /> : <StorageWriteRecovery conflict={storageStatus === "conflict"} message={storageError || "请先导出备份，再重试保存。"} onRetry={storageAction} onExport={onExport} /> : children}</main></div><nav className="mobile-bottom-nav" aria-label="移动端主导航"><Link className={active === "recent" ? "is-active" : ""} aria-current={active === "recent" ? "page" : undefined} href="/"><CalendarBlank size={20} aria-hidden="true" /><span>最近更新</span></Link><Link className={active === "following" ? "is-active" : ""} aria-current={active === "following" ? "page" : undefined} href="/following"><UserCirclePlus size={20} aria-hidden="true" /><span>关注列表</span></Link></nav>{settingsOpen ? <SettingsPanel close={() => setSettingsOpen(false)} onExport={onExport} onImport={onImport} onClear={onClear} /> : null}<NoticeHost /></div>;
 }
 
 function RecentView({ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: FrameProps) {

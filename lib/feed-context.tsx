@@ -46,6 +46,7 @@ type FeedContextValue = {
   dataAvailable: boolean;
   storageStatus: StorageStatus;
   storageError: string | null;
+  isSaving: boolean;
   setCreators: Dispatch<SetStateAction<Creator[]>>;
   setVideos: Dispatch<SetStateAction<VideoItem[]>>;
   replaceState: (next: FeedState) => void;
@@ -100,6 +101,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   const [videos, setVideosState] = useState<VideoItem[]>([]);
   const [storageStatus, setStorageStatus] = useState<StorageStatus>("loading");
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
   const [dataAvailable, setDataAvailable] = useState(false);
   const [hydrateAttempt, setHydrateAttempt] = useState(0);
   const [syncProgress, setSyncProgress] = useState<SyncProgress>(EMPTY_PROGRESS);
@@ -118,6 +120,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   const runIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const syncingRef = useRef(false);
+  const autoSyncStartedRef = useRef(false);
   const failedIdsRef = useRef<string[]>([]);
 
   useEffect(() => {
@@ -126,10 +129,21 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       : `tab-${performance.timeOrigin}-${performance.now()}`;
   }, []);
 
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (persistVersionRef.current <= persistedVersionRef.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
   const markDirty = useCallback(() => {
     const next = persistVersionRef.current + 1;
     persistVersionRef.current = next;
     setPersistVersion(next);
+    setIsSaving(true);
   }, []);
 
   const setCreators = useCallback<Dispatch<SetStateAction<Creator[]>>>((update) => {
@@ -207,6 +221,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
         persistVersionRef.current = 0;
         persistedVersionRef.current = 0;
         setPersistVersion(0);
+        setIsSaving(false);
         creatorsRef.current = state.creators;
         videosRef.current = state.videos;
         setCreatorsState(state.creators);
@@ -228,6 +243,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
         persistVersionRef.current = 0;
         persistedVersionRef.current = 0;
         setPersistVersion(0);
+        setIsSaving(false);
         setDataAvailable(true);
         setStorageStatus("empty");
         setStorageError(null);
@@ -266,21 +282,24 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           if (persistVersionRef.current <= targetVersion) {
             setStorageStatus(creatorSnapshot.length || videoSnapshot.length ? "ready" : "empty");
             setStorageError(null);
+            setIsSaving(false);
           }
         } catch (error) {
           if (error instanceof FeedStorageConflictError) {
             conflictRevisionRef.current = error.actualRevision;
             setStorageStatus("conflict");
             setStorageError("另一个标签页已更新本地数据。请先导出当前内容，再重试保存以确认覆盖。当前内容仍保留在本页。");
+            setIsSaving(false);
             return;
           }
           setStorageStatus("write-error");
           setStorageError("本地数据保存失败。请先导出备份，并检查浏览器存储权限或可用空间。");
+          setIsSaving(false);
         }
       });
     }, WRITE_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [dataAvailable, persistVersion, storageStatus]);
+  }, [dataAvailable, persistVersion, storageStatus, syncProgress.status]);
 
   useEffect(() => {
     if (typeof BroadcastChannel === "undefined") return;
@@ -483,6 +502,15 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     });
   }, [markDirty]);
 
+  useEffect(() => {
+    if (autoSyncStartedRef.current) return;
+    if (!dataAvailable || (storageStatus !== "ready" && storageStatus !== "empty")) return;
+
+    autoSyncStartedRef.current = true;
+    if (!creatorsRef.current.some((creator) => creator.enabled)) return;
+    void syncFeed();
+  }, [dataAvailable, storageStatus, syncFeed]);
+
   const cancelSync = useCallback(() => {
     if (!syncingRef.current) return;
     abortRef.current?.abort();
@@ -502,6 +530,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     dataAvailable,
     storageStatus,
     storageError,
+    isSaving,
     setCreators,
     setVideos,
     replaceState,
@@ -526,6 +555,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     setVideos,
     storageError,
     storageStatus,
+    isSaving,
     syncFeed,
     syncProgress,
     syncStatus,

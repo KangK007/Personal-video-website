@@ -36,6 +36,20 @@ const bilibiliCookieFile = path.resolve(
 );
 const sidecarTokenFile = path.join(localRoot, "sidecar-token.txt");
 
+function sidecarPythonIsUsable() {
+  if (!existsSync(sidecarPython)) return false;
+  try {
+    const version = execFileSync(
+      sidecarPython,
+      ["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+      { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return version === "3.11";
+  } catch {
+    return false;
+  }
+}
+
 function readSidecarToken() {
   if (!existsSync(sidecarTokenFile)) {
     return "";
@@ -168,14 +182,15 @@ async function main() {
   const appErrorLog = path.join(runtimeRoot, "app-error.log");
 
   let sidecarReady = sidecarToken ? await sidecarIsReady(sidecarUrl) : false;
+  const sidecarPythonReady = sidecarPythonIsUsable();
   const sidecarResponding = await endpointIsReady(`${sidecarUrl}/openapi.json`, (payload) => typeof payload?.openapi === "string" && payload?.info);
-  if (!sidecarToken && (sidecarResponding || existsSync(sidecarPython))) {
+  if (!sidecarToken && (sidecarResponding || sidecarPythonReady)) {
     throw new Error("已检测到本机抓取服务，但缺少访问令牌。请先运行 scripts/setup-sidecar.ps1");
   }
   if (sidecarResponding && !sidecarReady && !readManagedPid("sidecar", sidecarSupervisor)) {
     throw new Error("检测到未由本项目管理或令牌不匹配的本机抓取服务。请先手动关闭该进程再重试。");
   }
-  if (!sidecarReady && existsSync(sidecarPython)) {
+  if (!sidecarReady && sidecarPythonReady) {
     if (readManagedPid("sidecar", sidecarSupervisor)) {
       await stopManagedProcess("sidecar", sidecarSupervisor);
     }
@@ -192,7 +207,10 @@ async function main() {
   }
   if (!sidecarReady) {
     if (readManagedPid("sidecar", sidecarSupervisor)) await stopManagedProcess("sidecar", sidecarSupervisor);
-    console.warn("警告：哔站本机抓取服务不可用，网站仍会启动；详情见 .local/runtime 日志。");
+    const setupHint = existsSync(sidecarPython) && !sidecarPythonReady
+      ? "Python 3.11 虚拟环境不可运行，请重新运行 scripts/setup-sidecar.ps1。"
+      : "详情见 .local/runtime 日志。";
+    console.warn(`警告：哔站本机抓取服务不可用，网站仍会启动；${setupHint}`);
   }
 
   let appReady = await appIsReady(`${appUrl}/api/health`);
