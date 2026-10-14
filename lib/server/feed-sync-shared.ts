@@ -109,6 +109,15 @@ export function normalizeProfileUrl(value: unknown) {
   }
 }
 
+export function getCreatorIdentityKey(platform: Platform, profileUrl: string) {
+  const url = new URL(profileUrl);
+  const id = platform === "douyin"
+    ? url.pathname.match(/^\/user\/([^/]+)\/?$/i)?.[1]
+    : url.pathname.match(/^\/(?:space\/)?(\d+)(?:\/|$)/i)?.[1];
+  if (id) return `${platform}:creator:${id}`;
+  return `${platform}:url:${url.hostname.toLowerCase()}${url.pathname.replace(/\/+$/, "") || "/"}`;
+}
+
 export function isPlatformProfileUrl(platform: Platform, profileUrl: string) {
   const url = new URL(profileUrl);
   if (platform === "douyin") {

@@ -23,9 +23,34 @@ function getSidecarUrl() {
     if (!isLoopbackHost(url.hostname) || !["http:", "https:"].includes(url.protocol) || url.username || url.password) {
       return null;
     }
-    return url.toString().replace(/\/$/, "");
+    return url.origin;
   } catch {
     return null;
+  }
+}
+
+async function probeFetch(url: URL, token?: string) {
+  // Each probe request gets its own deadline: sharing one controller across
+  // sequential requests reports a healthy but slow sidecar as timed out.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+      signal: controller.signal,
+      cache: "no-store",
+      redirect: "error",
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function discardBody(response: Response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Releasing a probe response body is best effort only.
   }
 }
 
@@ -33,29 +58,17 @@ async function probeSidecar(baseUrl: string | null) {
   if (!baseUrl) return { configured: false, healthy: false, message: "未配置本机抓取服务" };
   const token = process.env.FEED_SIDECAR_TOKEN?.trim();
   if (!token) return { configured: true, healthy: false, message: "本机抓取服务令牌未配置" };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   try {
-    const openApiResponse = await fetch(new URL("openapi.json", `${baseUrl}/`), {
-      signal: controller.signal,
-      cache: "no-store",
-      redirect: "error",
-    });
+    const openApiResponse = await probeFetch(new URL("openapi.json", `${baseUrl}/`));
+    await discardBody(openApiResponse);
     if (!openApiResponse.ok) {
       return { configured: true, healthy: false, message: `本机抓取服务返回 ${openApiResponse.status}` };
     }
     const authProbeUrl = new URL("__local_auth_probe__", `${baseUrl}/`);
-    const unauthenticatedResponse = await fetch(authProbeUrl, {
-      signal: controller.signal,
-      cache: "no-store",
-      redirect: "error",
-    });
-    const authResponse = await fetch(authProbeUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: controller.signal,
-      cache: "no-store",
-      redirect: "error",
-    });
+    const unauthenticatedResponse = await probeFetch(authProbeUrl);
+    await discardBody(unauthenticatedResponse);
+    const authResponse = await probeFetch(authProbeUrl, token);
+    await discardBody(authResponse);
     if (unauthenticatedResponse.status !== 401) {
       return { configured: true, healthy: false, message: "本机抓取服务未启用鉴权" };
     }
@@ -67,8 +80,6 @@ async function probeSidecar(baseUrl: string | null) {
       ? "本机抓取服务响应超时"
       : "本机抓取服务未启动或无法连接";
     return { configured: true, healthy: false, message };
-  } finally {
-    clearTimeout(timer);
   }
 }
 

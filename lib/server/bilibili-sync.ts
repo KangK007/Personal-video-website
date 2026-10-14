@@ -1,5 +1,6 @@
 import "server-only";
 
+import { extractBvidFromPathname, isValidBvid } from "@/lib/bilibili-id";
 import { createVideoId } from "@/lib/sync-video-id";
 import {
   asRecord,
@@ -46,33 +47,47 @@ export function getSidecarBaseUrl() {
       || url.password) {
       return null;
     }
-    return url.toString().replace(/\/$/, "");
+    // Only the origin is meaningful: every request is built by resolving a relative
+    // path against the base, so a configured path prefix would be dropped for
+    // /openapi.json but kept for the API calls.
+    return url.origin;
   } catch {
     return null;
   }
 }
+
+const TOKEN_MISMATCH_MESSAGE = "本机抓取服务令牌不匹配，请重新运行本机抓取服务配置脚本；轮换令牌后需要重启网站";
 
 function sidecarErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "未知错误";
   if (/fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN/i.test(message)) {
     return "哔站本机抓取服务未启动或无法连接，请先运行 npm run start:local";
   }
+  if (/unauthorized|forbidden/i.test(message)) return TOKEN_MISMATCH_MESSAGE;
   return message;
 }
 
-export async function probeSidecar(baseUrl: string, signal?: AbortSignal) {
+async function discardBody(response: Response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Releasing a probe response body is best effort only.
+  }
+}
+
+async function probeRequest(url: URL, token: string | null, signal?: AbortSignal) {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   signal?.addEventListener("abort", onAbort, { once: true });
   const timeout = setTimeout(() => controller.abort(), SIDECAR_HEALTH_TIMEOUT_MS);
   try {
     throwIfAborted(signal);
-    const response = await fetch(new URL("openapi.json", `${baseUrl}/`), {
+    return await fetch(url, {
+      ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
       signal: controller.signal,
       cache: "no-store",
       redirect: "error",
     });
-    if (!response.ok) throw new Error(`抓取服务返回 ${response.status}`);
   } catch (error) {
     if (signal?.aborted) throw createAbortError();
     if (error instanceof Error && error.name === "AbortError") {
@@ -83,6 +98,31 @@ export async function probeSidecar(baseUrl: string, signal?: AbortSignal) {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", onAbort);
   }
+}
+
+/**
+ * Verifies that the sidecar is reachable *and* that the configured bearer token is
+ * accepted. `/openapi.json` is exempt from the sidecar's auth middleware, so a
+ * successful discovery request alone says nothing about the token.
+ */
+export async function probeSidecar(baseUrl: string, signal?: AbortSignal) {
+  const openApiResponse = await probeRequest(new URL("openapi.json", `${baseUrl}/`), null, signal);
+  await discardBody(openApiResponse);
+  if (!openApiResponse.ok) throw new Error(`抓取服务返回 ${openApiResponse.status}`);
+
+  const token = process.env.FEED_SIDECAR_TOKEN?.trim();
+  if (!token) {
+    throw new Error("未配置本机抓取服务令牌，请重新运行本机抓取服务配置脚本");
+  }
+  const authProbeUrl = new URL("__local_auth_probe__", `${baseUrl}/`);
+  const unauthenticated = await probeRequest(authProbeUrl, null, signal);
+  await discardBody(unauthenticated);
+  if (unauthenticated.status !== 401) {
+    throw new Error("本机抓取服务未启用鉴权，请重新运行本机抓取服务配置脚本");
+  }
+  const authenticated = await probeRequest(authProbeUrl, token, signal);
+  await discardBody(authenticated);
+  if (authenticated.status === 401) throw new Error(TOKEN_MISMATCH_MESSAGE);
 }
 
 function assertSuccessfulPayload(value: unknown) {
@@ -135,6 +175,10 @@ async function fetchSidecarJson(
         cache: "no-store",
         redirect: "error",
       });
+      if (response.status === 401 || response.status === 403) {
+        await discardBody(response);
+        throw new Error(TOKEN_MISMATCH_MESSAGE);
+      }
       if (!response.ok) {
         let detail = "";
         try {
@@ -176,14 +220,12 @@ async function fetchSidecarJson(
 function getBilibiliBvid(item: Record<string, unknown>) {
   const directBvid = [item.bvid, item.bv_id, item.id]
     .map(asString)
-    .find((candidate) => /^BV[0-9A-Za-z]{6,32}$/.test(candidate));
+    .find((candidate) => isValidBvid(candidate));
   if (directBvid) return directBvid;
 
   const arcUrl = normalizePlatformVideoUrl(item.arcurl, "bilibili");
   if (!arcUrl) return "";
-  return new URL(arcUrl).pathname.match(
-    /^\/video\/(BV[0-9A-Za-z]{6,32})(?:\/|$)/,
-  )?.[1] ?? "";
+  return extractBvidFromPathname(new URL(arcUrl).pathname) ?? "";
 }
 
 function getBilibiliUid(profileUrl: string) {

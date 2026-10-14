@@ -171,7 +171,21 @@ if ($currentSidecarCommit -ne $sidecarCommit) {
   throw "Unsupported sidecar revision $currentSidecarCommit. Expected $sidecarCommit."
 }
 
-if (-not (Test-SidecarPython $venvPython)) {
+$rebuildVenv = -not (Test-SidecarPython $venvPython)
+if (-not $rebuildVenv -and -not (Test-SidecarPip $venvPython)) {
+  if (Test-SidecarEnsurePip $venvPython) {
+    Write-Host "Restoring pip in the existing sidecar Python environment..."
+    & $venvPython -m ensurepip --upgrade
+    if ($LASTEXITCODE -ne 0 -or -not (Test-SidecarPip $venvPython)) {
+      Write-Host "The existing environment could not restore pip; replacing it..."
+      $rebuildVenv = $true
+    }
+  } else {
+    $rebuildVenv = $true
+  }
+}
+
+if ($rebuildVenv) {
   if ($SkipInstall) {
     throw "The sidecar Python 3.11 environment is missing or cannot run. Retry without -SkipInstall to rebuild it."
   }

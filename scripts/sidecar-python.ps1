@@ -10,6 +10,26 @@ function Test-SidecarPython([string]$PythonPath) {
   }
 }
 
+function Test-SidecarModule([string]$PythonPath, [string]$ModuleName) {
+  if (-not (Test-SidecarPython $PythonPath)) {
+    return $false
+  }
+  try {
+    & $PythonPath -m $ModuleName --version 2>$null | Out-Null
+    return $LASTEXITCODE -eq 0
+  } catch {
+    return $false
+  }
+}
+
+function Test-SidecarPip([string]$PythonPath) {
+  return Test-SidecarModule $PythonPath "pip"
+}
+
+function Test-SidecarEnsurePip([string]$PythonPath) {
+  return Test-SidecarModule $PythonPath "ensurepip"
+}
+
 function Get-Python311 {
   $python = Get-Command python -ErrorAction SilentlyContinue
   if ($python -and (Test-SidecarPython $python.Source)) {

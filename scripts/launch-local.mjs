@@ -119,6 +119,11 @@ async function waitFor(check, seconds = 30) {
   return false;
 }
 
+// A cold uvicorn start is usually a few seconds, but the first launch after a stop
+// can lose the port race while the previous worker is still exiting. Give the
+// supervisor room to restart the worker before reporting the sidecar as unavailable.
+const SIDECAR_READY_TIMEOUT_SECONDS = 90;
+
 function spawnDetached(name, command, args, cwd, stdoutPath, stderrPath, env = process.env) {
   const stdout = openSync(stdoutPath, "w");
   const stderr = openSync(stderrPath, "w");
@@ -203,14 +208,18 @@ async function main() {
       sidecarLog,
       sidecarErrorLog,
     );
-    sidecarReady = await waitFor(() => sidecarIsReady(sidecarUrl));
+    sidecarReady = await waitFor(() => sidecarIsReady(sidecarUrl), SIDECAR_READY_TIMEOUT_SECONDS);
   }
   if (!sidecarReady) {
-    if (readManagedPid("sidecar", sidecarSupervisor)) await stopManagedProcess("sidecar", sidecarSupervisor);
+    // Keep the managed supervisor alive: it keeps retrying the worker, so the site
+    // recovers as soon as the sidecar finishes starting instead of staying down.
+    const supervisorRunning = Boolean(readManagedPid("sidecar", sidecarSupervisor));
     const setupHint = existsSync(sidecarPython) && !sidecarPythonReady
       ? "Python 3.11 虚拟环境不可运行，请重新运行 scripts/setup-sidecar.ps1。"
-      : "详情见 .local/runtime 日志。";
-    console.warn(`警告：哔站本机抓取服务不可用，网站仍会启动；${setupHint}`);
+      : supervisorRunning
+        ? "监督器仍在后台重试，稍后会自动就绪；也可查看 .local/runtime 日志。"
+        : "详情见 .local/runtime 日志。";
+    console.warn(`警告：哔站本机抓取服务在 ${SIDECAR_READY_TIMEOUT_SECONDS} 秒内未就绪，网站仍会启动；${setupHint}`);
   }
 
   let appReady = await appIsReady(`${appUrl}/api/health`);
@@ -252,7 +261,7 @@ async function main() {
   console.log(`网站已就绪：http://127.0.0.1:${appPort}`);
   console.log(`健康检查：http://127.0.0.1:${appPort}/api/health`);
   console.log(`运行日志：${runtimeRoot}`);
-  if (!sidecarReady) console.log("提示：当前仅哔站同步不可用，抖音与本地数据功能仍可使用。");
+  if (!sidecarReady) console.log("提示：哔站同步暂时不可用，抖音与本地数据功能仍可使用；若监督器仍在运行，它会继续自动重试。");
 }
 
 async function runWithLaunchLock() {

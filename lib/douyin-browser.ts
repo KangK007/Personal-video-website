@@ -120,13 +120,18 @@ export function parseDouyinPostPayload(body: string, status: number) {
       "douyin_rate_limited",
     );
   }
-  const hasMore = record.has_more === true || Number(record.has_more) === 1;
-  const hasExplicitEnd = Object.hasOwn(record, "has_more")
-    && (record.has_more === false || record.has_more === 0 || record.has_more === "0");
+  const hasMore = record.has_more === true || record.has_more === 1 || record.has_more === "1";
+  const hasExplicitEnd = record.has_more === false || record.has_more === 0 || record.has_more === "0";
   if (record.aweme_list.length === 0 && !hasExplicitEnd) {
     throw new DouyinSyncError(
       "抖音返回未确认结束的空投稿列表，疑似触发限流或登录状态异常；已有缓存已保留",
       "douyin_empty_response",
+    );
+  }
+  if (record.aweme_list.length > 0 && !hasMore && !hasExplicitEnd) {
+    throw new DouyinSyncError(
+      "抖音投稿分页状态缺失，响应不完整；已有缓存已保留",
+      "douyin_invalid_response",
     );
   }
   if (record.aweme_list.some((item) => !/^\d+$/.test(String(asRecord(item).aweme_id ?? "")))) {
@@ -192,6 +197,9 @@ async function waitForNextPostResponse(page: Page, signal?: AbortSignal) {
       throwIfAborted(signal);
     }
     const responsePromise = page.waitForResponse(isPostResponse, { timeout: PAGE_TIMEOUT_MS });
+    // Attach a handler immediately: when the scroll container is missing the evaluate
+    // below throws first, and an unawaited rejection would surface process-wide.
+    responsePromise.catch(() => undefined);
     await page.locator(PROFILE_SCROLL_SELECTOR).evaluate((element) => {
       const scroller = element as HTMLElement;
       scroller.scrollTop = scroller.scrollHeight;
@@ -285,10 +293,15 @@ async function createContext(browser: Browser, executablePath: string, cookieHea
     viewport: getViewport(cookies),
     locale: "zh-CN",
   });
-  await context.addCookies(cookies);
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-  });
+  try {
+    await context.addCookies(cookies);
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    });
+  } catch (error) {
+    await context.close().catch(() => undefined);
+    throw error;
+  }
   return context;
 }
 
@@ -415,7 +428,11 @@ async function fetchUserPosts(
     throw error;
   } finally {
     signal?.removeEventListener("abort", onAbort);
-    if (!page.isClosed()) await page.close();
+    try {
+      if (!page.isClosed()) await page.close();
+    } catch {
+      // Cleanup must not replace the synchronization result.
+    }
   }
 }
 
@@ -444,7 +461,11 @@ export async function openDouyinBrowserSession(signal?: AbortSignal): Promise<Do
         try {
           return await fetchUserPosts(context, profileUrl, knownVideoIds, requestSignal);
         } finally {
-          await context.close();
+          try {
+            await context.close();
+          } catch {
+            // Cleanup must not replace the synchronization result.
+          }
         }
       },
       close: () => browser.close(),

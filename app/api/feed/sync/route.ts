@@ -19,6 +19,7 @@ import {
   firstImageUrl,
   firstString,
   formatDuration,
+  getCreatorIdentityKey,
   isPlatformProfileUrl,
   isTransientRequestError,
   normalizeCreatorProfile,
@@ -76,9 +77,11 @@ function getDouyinVideos(payload: unknown, creator: CreatorInput, syncedAt: stri
 
   return list.map((value, index): NormalizedVideo => {
     const item = asRecord(value);
+    // Must stay in sync with the client's stored-URL rule (lib/feed-storage.ts):
+    // a shorter id would be dropped there and turn a full snapshot into "incomplete".
     const videoId = [item.aweme_id, item.awemeId, item.id]
       .map(asString)
-      .find((candidate) => /^\d+$/.test(candidate)) ?? "";
+      .find((candidate) => /^\d{10,30}$/.test(candidate)) ?? "";
     if (!videoId) {
       throw new Error(`抖音第 ${index + 1} 条投稿缺少有效作品 ID，未完整同步`);
     }
@@ -249,7 +252,9 @@ async function runSync(request: Request, creators: CreatorInput[]) {
           syncedAt,
           request.signal,
         );
-        videos.push(...synced.videos);
+        // Avoid the argument-spread limit: a single creator may legitimately return
+        // up to MAX_BILIBILI_VIDEOS entries.
+        for (const video of synced.videos) videos.push(video);
         results.push({
           creatorId: creator.id,
           status: "success",
@@ -298,8 +303,12 @@ async function runSync(request: Request, creators: CreatorInput[]) {
   }
 
   const hasSuccess = results.some((result) => result.status === "success");
+  const needsDouyin = creators.some((creator) => creator.platform === "douyin");
+  const needsBilibili = creators.some((creator) => creator.platform === "bilibili");
   return NextResponse.json({
-    configured: Boolean(baseUrl || douyinBrowser),
+    // "A provider is set up for what this request asks for", not "the provider is
+    // healthy": unhealthy providers fail per creator with their own message.
+    configured: (needsDouyin && Boolean(douyinBrowser)) || (needsBilibili && Boolean(baseUrl)),
     syncedAt,
     videos,
     results,
@@ -330,6 +339,7 @@ export async function POST(request: Request) {
 
   const creators: CreatorInput[] = [];
   const creatorIds = new Set<string>();
+  const creatorIdentityKeys = new Set<string>();
   for (const value of body.creators) {
     const item = asRecord(value);
     const profileUrl = normalizeProfileUrl(item.profileUrl);
@@ -352,7 +362,12 @@ export async function POST(request: Request) {
     ) {
       return NextResponse.json({ error: "关注名单中存在无效或重复的博主数据" }, { status: 400 });
     }
+    const identityKey = getCreatorIdentityKey(item.platform, profileUrl);
+    if (creatorIdentityKeys.has(identityKey)) {
+      return NextResponse.json({ error: "关注名单中存在无效或重复的博主数据" }, { status: 400 });
+    }
     creatorIds.add(id);
+    creatorIdentityKeys.add(identityKey);
     creators.push({
       id,
       platform: item.platform,
