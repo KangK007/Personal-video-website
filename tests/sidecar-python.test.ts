@@ -27,6 +27,23 @@ function probePython(pythonPath: string) {
   }).trim();
 }
 
+function createModuleStub(name: string, moduleName: string, exitCode = 0) {
+  const stubPath = path.join(fixtureRoot, `${name}.cmd`);
+  writeFileSync(
+    stubPath,
+    `@echo off\r\nif /I "%~1"=="-c" (echo 3.11& exit /b 0)\r\nif /I not "%~1"=="-m" exit /b 4\r\nif /I not "%~2"=="${moduleName}" exit /b 5\r\nexit /b ${exitCode}\r\n`,
+  );
+  return stubPath;
+}
+
+function probeModule(functionName: string, pythonPath: string) {
+  const command = `. ${powershellLiteral(helperPath)}; if (${functionName} ${powershellLiteral(pythonPath)}) { 'valid' } else { 'invalid' }`;
+  return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+    encoding: "utf8",
+    windowsHide: true,
+  }).trim();
+}
+
 describe.skipIf(process.platform !== "win32")("sidecar Python validation", () => {
   it("accepts a working Python 3.11 interpreter", () => {
     expect(probePython(createPythonStub("valid", "3.11"))).toBe("valid");
@@ -36,7 +53,21 @@ describe.skipIf(process.platform !== "win32")("sidecar Python validation", () =>
     expect(probePython(createPythonStub("broken", "3.11", 103))).toBe("invalid");
   });
 
+  it("rejects a stale audit-tool interpreter even when its executable file exists", () => {
+    expect(probePython(createPythonStub("stale-audit-tool", "3.11", 103))).toBe("invalid");
+  });
+
   it("rejects an interpreter with the wrong Python version", () => {
     expect(probePython(createPythonStub("wrong-version", "3.12"))).toBe("invalid");
+  });
+
+  it("detects whether the sidecar interpreter has a working pip module", () => {
+    expect(probeModule("Test-SidecarPip", createModuleStub("pip-present", "pip"))).toBe("valid");
+    expect(probeModule("Test-SidecarPip", createModuleStub("pip-missing", "pip", 1))).toBe("invalid");
+  });
+
+  it("detects whether ensurepip is available for environment repair", () => {
+    expect(probeModule("Test-SidecarEnsurePip", createModuleStub("ensurepip-present", "ensurepip"))).toBe("valid");
+    expect(probeModule("Test-SidecarEnsurePip", createModuleStub("ensurepip-missing", "ensurepip", 1))).toBe("invalid");
   });
 });

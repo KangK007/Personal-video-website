@@ -62,4 +62,23 @@ describe("sortVideos", () => {
 
     expect(result.map((item) => item.id)).toEqual(["newer", "older", "unknown"]);
   });
+
+  it("breaks ties between unknown dates by creation time instead of dropping them", () => {
+    const result = sortVideos([
+      video({
+        id: "unknown-older",
+        videoUrl: "https://www.bilibili.com/video/BV1unknown1",
+        publishedAt: undefined,
+        createdAt: "2026-09-01T00:00:00.000Z",
+      }),
+      video({
+        id: "unknown-newer",
+        videoUrl: "https://www.bilibili.com/video/BV1unknown2",
+        publishedAt: undefined,
+        createdAt: "2026-09-02T00:00:00.000Z",
+      }),
+    ]);
+
+    expect(result.map((item) => item.id)).toEqual(["unknown-newer", "unknown-older"]);
+  });
 });

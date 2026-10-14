@@ -40,8 +40,21 @@ Git 仓库只保存源码、配置模板、锁文件、测试和说明文档。�
 
 ## 当前验证基线
 
-- 单元测试：10 个测试文件，65 个测试通过。
+- 单元测试：14 个测试文件，117 个测试通过（`npm test`）。
+- 端到端冒烟：`npm run test:e2e`（需要先启动生产构建、并存在 Edge 或 Chrome；见下）。
 - TypeScript：`npm run typecheck` 通过。
 - ESLint：`npm run lint` 通过。
 - Next.js 生产构建：`npm run build` 通过。
 - 自动化同步依赖平台 Cookie、平台公开接口和本机浏览器；这些外部条件不由 CI 模拟。
+
+### 端到端冒烟
+
+`scripts/e2e-smoke.mjs` 用 Playwright 驱动本机 Edge/Chrome，覆盖首次使用、批量导入、自动同步、筛选搜索、手动保存、关注列表操作与撤销、同步失败重试、备份导出/清空/导入、个人页、主题、移动端布局，以及残留旧版缓存、分享短链接和空态同步按钮等边界。平台接口（`/api/feed/sync`、`/api/metadata`）在浏览器网络层被替换为确定性桩，因此它验证的是本站行为，不是平台可用性。外部服务必须另行用真实 Cookie 和平台接口验证。
+
+```powershell
+npm run build
+npx next start --hostname 127.0.0.1 --port 3100
+npm run test:e2e
+```
+
+脚本使用 `.local/e2e/` 保存独立的浏览器配置和截图，不会读写正常使用的浏览器数据。

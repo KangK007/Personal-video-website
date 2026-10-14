@@ -48,6 +48,18 @@ describe("mergeSyncResponse", () => {
     expect(result.creators[0].lastSyncAt).toBe("2026-09-13T00:00:00.000Z");
   });
 
+  it.each(["BV123456", `BV${"a".repeat(32)}`])("keeps a supported BVID boundary %s during snapshot merge", (bvid) => {
+    const incoming = syncedVideo({ id: "boundary", videoUrl: `https://www.bilibili.com/video/${bvid}` });
+    const result = merge([], {
+      syncedAt: "2026-09-13T00:00:00.000Z",
+      videos: [incoming],
+      results: [{ creatorId: creator.id, status: "success", complete: true, count: 1 }],
+    });
+
+    expect(result.failedCreatorIds).toEqual([]);
+    expect(result.videos[0].videoUrl).toBe(incoming.videoUrl);
+  });
+
   it.each([
     { complete: false, count: 1, label: "incomplete flag" },
     { complete: true, count: 2, label: "count mismatch" },

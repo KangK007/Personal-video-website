@@ -1,6 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { migrateFeedState, readFeedState, recoverFeedState } from "@/lib/feed-storage";
+import {
+  FeedStorageConflictError,
+  migrateFeedState,
+  readFeedState,
+  recoverFeedState,
+  writeFeedState,
+} from "@/lib/feed-storage";
 
 const creator = {
   id: "creator-1",
@@ -220,6 +226,45 @@ describe("feed storage migration", () => {
     expect(recoverFeedState(state)?.state.videos).toEqual([]);
   });
 
+  it("removes invalid video dates before they reach sorting", () => {
+    const migrated = migrateFeedState({
+      version: 2,
+      creators: [{ ...creator, nameSource: "fallback" }],
+      videos: [{
+        ...video("video-invalid-date", "BV1abcdefghi"),
+        source: "manual",
+        createdAt: "2026-02-30",
+        publishedAt: "not-a-date",
+      }],
+    });
+
+    expect(migrated?.videos[0]).toMatchObject({
+      id: "video-invalid-date",
+      createdAt: "1970-01-01T00:00:00.000Z",
+    });
+    expect(migrated?.videos[0].publishedAt).toBeUndefined();
+  });
+
+  it("removes an invalid last sync date from imported creators", () => {
+    const migrated = migrateFeedState({
+      version: 2,
+      creators: [{ ...creator, nameSource: "fallback", lastSyncAt: "2026-02-30" }],
+      videos: [],
+    });
+
+    expect(migrated?.creators[0].lastSyncAt).toBeUndefined();
+  });
+
+  it.each(["BV123456", `BV${"a".repeat(32)}`])("accepts supported BVID boundary %s", (bvid) => {
+    const migrated = migrateFeedState({
+      version: 2,
+      creators: [{ ...creator, nameSource: "fallback" }],
+      videos: [video("video-boundary", bvid)],
+    });
+
+    expect(migrated?.videos[0].videoUrl).toContain(bvid);
+  });
+
   it("rejects a creator profile hosted on the wrong platform", () => {
     expect(migrateFeedState({
       version: 2,
@@ -293,5 +338,116 @@ describe("feed storage migration", () => {
     } finally {
       Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: originalIndexedDb });
     }
+  });
+
+  it("reports a blocked database upgrade so the user can close other tabs and retry", async () => {
+    const originalIndexedDb = globalThis.indexedDB;
+    const database = { close: vi.fn() };
+    const request = {
+      result: database,
+      onblocked: null as (() => void) | null,
+      onsuccess: null as (() => void) | null,
+      onerror: null as (() => void) | null,
+      onupgradeneeded: null as (() => void) | null,
+    };
+    Object.defineProperty(globalThis, "indexedDB", {
+      configurable: true,
+      value: { open: () => request },
+    });
+    try {
+      const pending = readFeedState();
+      request.onblocked?.();
+      await expect(pending).rejects.toThrow("其他标签页");
+      request.onsuccess?.();
+      expect(database.close).toHaveBeenCalledOnce();
+    } finally {
+      Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: originalIndexedDb });
+    }
+  });
+
+  it("times out a database open request that never responds", async () => {
+    vi.useFakeTimers();
+    const originalIndexedDb = globalThis.indexedDB;
+    Object.defineProperty(globalThis, "indexedDB", {
+      configurable: true,
+      value: { open: () => ({ onblocked: null, onsuccess: null, onerror: null, onupgradeneeded: null }) },
+    });
+    try {
+      const assertion = expect(readFeedState()).rejects.toThrow("超时");
+      await vi.advanceTimersByTimeAsync(15_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: originalIndexedDb });
+    }
+  });
+});
+
+function stubWritableDatabase(storedRevision: number) {
+  const put = vi.fn();
+  const database = {
+    transaction: () => {
+      const transaction = {
+        objectStore: () => ({
+          get: () => {
+            const request: { result?: unknown; onsuccess: ((event: Event) => void) | null; onerror: ((event: Event) => void) | null } = {
+              result: { revision: storedRevision },
+              onsuccess: null,
+              onerror: null,
+            };
+            queueMicrotask(() => request.onsuccess?.({} as Event));
+            return request;
+          },
+          put: (...args: unknown[]) => {
+            put(...args);
+            queueMicrotask(() => transaction.oncomplete?.());
+          },
+        }),
+        abort: () => {
+          queueMicrotask(() => transaction.onabort?.({} as Event));
+        },
+        oncomplete: null as (() => void) | null,
+        onerror: null as ((event: Event) => void) | null,
+        onabort: null as ((event: Event) => void) | null,
+      };
+      return transaction;
+    },
+    close: vi.fn(),
+  };
+  const indexedDb = {
+    open: () => {
+      const request: {
+        result: IDBDatabase;
+        onsuccess: ((event: Event) => void) | null;
+        onerror: ((event: Event) => void) | null;
+        onupgradeneeded: ((event: IDBVersionChangeEvent) => void) | null;
+      } = { result: database as unknown as IDBDatabase, onsuccess: null, onerror: null, onupgradeneeded: null };
+      queueMicrotask(() => request.onsuccess?.({} as Event));
+      return request;
+    },
+  } as unknown as IDBFactory;
+  return { indexedDb, put };
+}
+
+describe("writeFeedState revision handling", () => {
+  const originalIndexedDb = globalThis.indexedDB;
+
+  afterEach(() => {
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: originalIndexedDb });
+  });
+
+  it("rejects a stale writer so concurrent tabs cannot overwrite each other", async () => {
+    const { indexedDb } = stubWritableDatabase(7);
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: indexedDb });
+
+    await expect(writeFeedState([], [], 0, "writer")).rejects.toBeInstanceOf(FeedStorageConflictError);
+  });
+
+  it("adopts the stored revision for an explicit replacement when the baseline is unknown", async () => {
+    const { indexedDb, put } = stubWritableDatabase(7);
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: indexedDb });
+
+    await expect(writeFeedState([], [], 0, "writer", true)).resolves.toBe(8);
+    expect(put).toHaveBeenCalledTimes(1);
   });
 });

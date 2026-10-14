@@ -39,4 +39,18 @@ describe("parseDouyinPostPayload", () => {
       200,
     ).items).toHaveLength(1);
   });
+
+  it("rejects a non-empty list without pagination completeness metadata", () => {
+    expect(() => parseDouyinPostPayload(
+      JSON.stringify({ status_code: 0, aweme_list: [{ aweme_id: "1234567890123" }] }),
+      200,
+    )).toThrow("分页状态缺失");
+  });
+
+  it("rejects an invalid pagination value before replacing cached posts", () => {
+    expect(() => parseDouyinPostPayload(
+      JSON.stringify({ status_code: 0, aweme_list: [{ aweme_id: "1234567890123" }], has_more: 2 }),
+      200,
+    )).toThrow("分页状态缺失");
+  });
 });

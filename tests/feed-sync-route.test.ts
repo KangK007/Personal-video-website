@@ -73,6 +73,27 @@ function posts(videoId = "1234567890123456789") {
 }
 
 describe("feed sync route cancellation and cleanup", () => {
+  it("rejects two creator IDs that point to the same profile", async () => {
+    const response = await POST(syncRequest([
+      creator("same-user"),
+      { ...creator("alias-id"), profileUrl: "https://m.iesdouyin.com/user/same-user/?from=share" },
+    ]));
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: "关注名单中存在无效或重复的博主数据" });
+    expect(mocks.openDouyinBrowserSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects Bilibili profile host aliases before contacting the sidecar", async () => {
+    const response = await POST(syncRequest([
+      { id: "bili-1", platform: "bilibili", profileUrl: "https://space.bilibili.com/123456", name: "博主一" },
+      { id: "bili-2", platform: "bilibili", profileUrl: "https://www.bilibili.com/space/123456/?from=share", name: "博主二" },
+    ]));
+
+    expect(response.status).toBe(400);
+    expect(mocks.openDouyinBrowserSession).not.toHaveBeenCalled();
+  });
+
   it("returns a cancellation response when the request is aborted during Douyin cooldown", async () => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0);
@@ -114,8 +135,41 @@ describe("feed sync route cancellation and cleanup", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
+      configured: true,
       videos: [{ title: "测试投稿" }],
       results: [{ creatorId: "only", status: "success", complete: true, count: 1 }],
+    });
+  });
+
+  it("reports not-configured while keeping the accurate per-creator Douyin message", async () => {
+    mocks.openDouyinBrowserSession.mockRejectedValue(
+      new Error("未配置抖音 Cookie，请重新运行本机抓取服务配置脚本"),
+    );
+
+    const response = await POST(syncRequest([creator("only")]));
+    const body = await response.json() as { configured: boolean; results: Array<{ message?: string }> };
+
+    // The client shows results[].message when results are present, so the setup
+    // guidance must survive instead of being replaced by a generic sidecar message.
+    expect(response.status).toBe(502);
+    expect(body.configured).toBe(false);
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].message).toContain("抖音 Cookie");
+  });
+
+  it("rejects a Douyin post whose aweme id is too short to form a video URL", async () => {
+    mocks.openDouyinBrowserSession.mockResolvedValue({
+      fetchUserPosts: vi.fn().mockResolvedValue(posts("12345")),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const response = await POST(syncRequest([creator("only")]));
+    const body = await response.json() as { videos: unknown[]; results: Array<{ status: string; message?: string }> };
+
+    expect(body.videos).toEqual([]);
+    expect(body.results[0]).toMatchObject({
+      status: "error",
+      message: expect.stringContaining("缺少有效作品 ID"),
     });
   });
 });

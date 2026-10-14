@@ -87,6 +87,16 @@ describe("syncBilibiliCreator", () => {
     });
   });
 
+  it.each(["BV123456", `BV${"a".repeat(32)}`])("accepts a supported BVID boundary %s", async (bvid) => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(jsonResponse(videoPage([{ bvid, title: "边界作品" }], { pn: 1, ps: 30, count: 1 })))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, data: {} })));
+
+    const result = await syncBilibiliCreator("http://127.0.0.1:8001", creator, syncedAt);
+
+    expect(result.videos[0].videoUrl).toBe(`https://www.bilibili.com/video/${bvid}`);
+  });
+
   it("rejects the whole snapshot when an entry has no valid BVID", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(videoPage([{
       id: "not-a-bvid",
