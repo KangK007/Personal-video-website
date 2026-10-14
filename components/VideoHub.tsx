@@ -53,9 +53,14 @@ import {
   formatLongDate,
   MAX_CREATOR_IMPORT_LINES,
   normalizeUrl,
+  normalizeOptionalMediaUrl,
+  appendUniqueCreators,
+  appendUniqueVideo,
+  isResolvableShortVideoLink,
   parseCreatorLines,
   platformClass,
   platformLabel,
+  sameEntityIds,
   type CreatorDraft,
 } from "@/components/video-hub/helpers";
 import { useFeed } from "@/lib/feed-context";
@@ -83,18 +88,26 @@ function makeId(prefix: string) {
 function removeSavedVideo(
   video: VideoItem,
   setVideos: Dispatch<SetStateAction<VideoItem[]>>,
+  getDataEpoch: () => number,
+  canRestore: () => boolean,
   showNotice: (input: NoticeInput, duration?: number) => string,
   clearNotice: (id?: string) => void,
 ) {
   const videoKey = getFeedVideoIdentityKey(video.videoUrl, video.platform);
   setVideos((current) => current.filter((entry) => entry.id !== video.id));
+  const removalEpoch = getDataEpoch();
 
   let noticeId = "";
   const undo = () => {
+    if (getDataEpoch() !== removalEpoch || !canRestore()) {
+      clearNotice(noticeId);
+      showNotice({ kind: "info", text: "本地数据已变化，无法撤销这项操作" });
+      return;
+    }
     setVideos((current) => current.some((entry) => (
       entry.id === video.id
       || getFeedVideoIdentityKey(entry.videoUrl, entry.platform) === videoKey
-    )) ? current : [...current, video]);
+    )) || getDataEpoch() !== removalEpoch || !canRestore() ? current : [...current, video]);
     clearNotice(noticeId);
   };
 
@@ -189,7 +202,6 @@ function Avatar({ creator, size = "normal" }: { creator: Creator; size?: "normal
   const className = `creator-avatar ${size === "large" ? "creator-avatar-large" : ""} ${platformClass(creator.platform)}`;
   if (creator.avatarUrl && !failed) {
     // Platform CDN hosts vary; loading them directly avoids proxying arbitrary remote URLs.
-    // eslint-disable-next-line @next/next/no-img-element
     return <img src={creator.avatarUrl} alt="" className={className} loading="lazy" referrerPolicy="no-referrer" onError={() => setFailedUrl(creator.avatarUrl ?? "")} />;
   }
   return <span className={className} aria-hidden="true">{getInitials(creator.name)}</span>;
@@ -199,7 +211,6 @@ function VideoCover({ video }: { video: VideoItem }) {
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
   const failed = Boolean(video.coverUrl && failedUrl === video.coverUrl);
   if (video.coverUrl && !failed) {
-    // eslint-disable-next-line @next/next/no-img-element
     return <img src={video.coverUrl} alt={`${video.title}的封面`} className="video-cover" loading="lazy" decoding="async" referrerPolicy="no-referrer" onError={() => setFailedUrl(video.coverUrl ?? "")} />;
   }
   return <div className={`cover-fallback ${platformClass(video.platform)}`} aria-label="封面不可用"><FilmSlate size={34} weight="duotone" aria-hidden="true" /></div>;
@@ -213,7 +224,7 @@ function VideoCard({ video, creator, view, onDelete }: { video: VideoItem; creat
         <VideoCover video={video} />
         {video.duration ? <span className="duration">{video.duration}</span> : null}
       </a>
-      {onDelete ? <button className="card-delete" type="button" onClick={() => onDelete(video)} aria-label={`删除手动保存的视频：${video.title}`} title="删除视频"><Trash size={16} aria-hidden="true" /></button> : null}
+      {onDelete ? <button className="card-delete" type="button" onClick={() => onDelete(video)} aria-label={`删除视频：${video.title}`} title="删除视频"><Trash size={16} aria-hidden="true" /></button> : null}
       <div className="video-card-body">
         <div className="video-meta-top"><span className={`platform-label ${platformClass(video.platform)}`}><span className="platform-mark" aria-hidden="true" />{label}</span><span className={!parsePublishedAt(video.publishedAt) ? "unknown-date" : ""}>{formatDate(video.publishedAt)}</span></div>
         <h3 className="video-title"><a href={video.videoUrl} target="_blank" rel="noreferrer" aria-label={`在${label}打开：${video.title}`}>{video.title}</a></h3>
@@ -270,6 +281,7 @@ function StorageWriteRecovery({ message, onRetry, onExport, conflict = false }: 
 type EmptyKind = "no-creators" | "no-recent" | "no-platform" | "no-videos" | "no-match" | "no-following-match";
 
 function EmptyState({ kind, onAdd, onSync, onClear, query, platform }: { kind: EmptyKind; onAdd: () => void; onSync: () => void; onClear?: () => void; query?: string; platform?: PlatformFilter }) {
+  const { syncStatus } = useFeed();
   const copy: Record<EmptyKind, [string, string]> = {
     "no-creators": ["还没有关注博主", "添加抖音或哔站主页后，这里会成为你的专属视频收件箱。"],
     "no-recent": ["最近 7 天没有更新", "同步一次关注流，或者稍后再回来看看。"],
@@ -287,7 +299,7 @@ function EmptyState({ kind, onAdd, onSync, onClear, query, platform }: { kind: E
     "no-match": <MagnifyingGlass size={30} weight="duotone" />,
     "no-following-match": <MagnifyingGlass size={30} weight="duotone" />,
   };
-  return <div className={`empty-state empty-${kind}`}><span className="empty-icon" aria-hidden="true">{icons[kind]}</span><h3>{title}</h3><p>{description}</p><div className="empty-actions">{kind === "no-creators" ? <button className="primary-button" type="button" onClick={onAdd}><Plus size={18} aria-hidden="true" />添加博主</button> : null}{kind === "no-recent" || kind === "no-platform" || kind === "no-videos" ? <button className="secondary-button" type="button" onClick={onSync}><ArrowsClockwise size={18} aria-hidden="true" />同步关注流</button> : null}{(kind === "no-match" || kind === "no-following-match") && onClear ? <button className="secondary-button" type="button" onClick={onClear}>清除筛选</button> : null}</div></div>;
+  return <div className={`empty-state empty-${kind}`}><span className="empty-icon" aria-hidden="true">{icons[kind]}</span><h3>{title}</h3><p>{description}</p><div className="empty-actions">{kind === "no-creators" ? <button className="primary-button" type="button" onClick={onAdd}><Plus size={18} aria-hidden="true" />添加博主</button> : null}{kind === "no-recent" || kind === "no-platform" || kind === "no-videos" ? <button className="secondary-button" type="button" onClick={onSync} disabled={syncStatus === "loading"}><ArrowsClockwise size={18} aria-hidden="true" />{syncStatus === "loading" ? "同步中" : "同步关注流"}</button> : null}{(kind === "no-match" || kind === "no-following-match") && onClear ? <button className="secondary-button" type="button" onClick={onClear}>清除筛选</button> : null}</div></div>;
 }
 
 function PageHeader({ eyebrow, title, subtitle, stat, action }: { eyebrow: string; title: string; subtitle: string; stat: string; action?: ReactNode }) {
@@ -313,6 +325,8 @@ function CreatorModal({ close, onAdd, existingUrls }: { close: () => void; onAdd
   const [value, setValue] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const submitLockRef = useRef(false);
   const parsed = useMemo(() => parseCreatorLines(value), [value]);
   const hasParseError = parsed.invalidLines.length > 0 || parsed.limitExceeded;
   const importSummary = useMemo(() => {
@@ -333,17 +347,20 @@ function CreatorModal({ close, onAdd, existingUrls }: { close: () => void; onAdd
   const hasFieldError = hasParseError || (submitted && !value.trim()) || noNewCreators || Boolean(submitError);
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    if (submitLockRef.current) return;
     setSubmitted(true);
     setSubmitError("");
     if (!value.trim() || hasParseError || !importSummary.newCount) { textareaRef.current?.focus(); return; }
+    submitLockRef.current = true;
+    setSubmitting(true);
     const error = onAdd(parsed.entries.filter((entry) => !existingUrls.has(getFeedCreatorIdentityKey(entry.profileUrl, entry.platform))));
-    if (error) { setSubmitError(error); textareaRef.current?.focus(); return; }
+    if (error) { submitLockRef.current = false; setSubmitting(false); setSubmitError(error); textareaRef.current?.focus(); return; }
     close();
   };
-  return <Modal title="添加关注博主" description="逐行粘贴主页链接，可在链接前后写昵称。" onClose={close} initialFocusRef={textareaRef} className="creator-modal"><form onSubmit={submit}><label className="field-label" htmlFor="creator-lines">主页名单</label><textarea ref={textareaRef} id="creator-lines" className="creator-textarea" value={value} onChange={(event) => { setValue(event.target.value); setSubmitted(false); setSubmitError(""); }} placeholder={'https://www.douyin.com/user/xxx\n哔站作者\thttps://space.bilibili.com/123'} rows={8} aria-invalid={hasFieldError} aria-describedby={hasFieldError ? errorId : undefined} /><div className="import-summary"><span><strong>{parsed.entries.length}</strong> 条有效</span><span><strong>{importSummary.duplicateCount}</strong> 条重复</span><span className={parsed.invalidLines.length ? "has-error" : ""}><strong>{parsed.invalidLines.length}</strong> 行无效</span><span><strong>{importSummary.newCount}</strong> 位将新增</span></div>{hasFieldError ? <div id={errorId}>{parsed.limitExceeded ? <p className="field-error" role="alert">单次最多导入 {MAX_CREATOR_IMPORT_LINES.toLocaleString("zh-CN")} 行，请拆分名单后重试。</p> : null}{parsed.invalidLines.length ? <p className="field-error" role="alert">第 {parsed.invalidLines.join(", ")} 行无法识别。修正后才能确认导入。</p> : null}{submitted && !value.trim() ? <p className="field-error" role="alert">请先粘贴至少一条主页链接。</p> : null}{noNewCreators ? <p className="field-error" role="alert">名单中没有可添加的新博主，请检查重复链接。</p> : null}{submitError ? <p className="field-error" role="alert">{submitError}</p> : null}</div> : null}<div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit"><UserCirclePlus size={18} aria-hidden="true" />确认添加</button></div></form></Modal>;
+  return <Modal title="添加关注博主" description="逐行粘贴主页链接，可在链接前后写昵称。" onClose={close} initialFocusRef={textareaRef} className="creator-modal"><form onSubmit={submit}><label className="field-label" htmlFor="creator-lines">主页名单</label><textarea ref={textareaRef} id="creator-lines" className="creator-textarea" value={value} onChange={(event) => { setValue(event.target.value); setSubmitted(false); setSubmitError(""); }} placeholder={'https://www.douyin.com/user/xxx\n哔站作者\thttps://space.bilibili.com/123'} rows={8} aria-invalid={hasFieldError} aria-describedby={hasFieldError ? errorId : undefined} /><div className="import-summary"><span><strong>{parsed.entries.length}</strong> 条有效</span><span><strong>{importSummary.duplicateCount}</strong> 条重复</span><span className={parsed.invalidLines.length ? "has-error" : ""}><strong>{parsed.invalidLines.length}</strong> 行无效</span><span><strong>{importSummary.newCount}</strong> 位将新增</span></div>{hasFieldError ? <div id={errorId}>{parsed.limitExceeded ? <p className="field-error" role="alert">单次最多导入 {MAX_CREATOR_IMPORT_LINES.toLocaleString("zh-CN")} 行，请拆分名单后重试。</p> : null}{parsed.invalidLines.length ? <p className="field-error" role="alert">第 {parsed.invalidLines.join(", ")} 行无法识别。修正后才能确认导入。</p> : null}{submitted && !value.trim() ? <p className="field-error" role="alert">请先粘贴至少一条主页链接。</p> : null}{noNewCreators ? <p className="field-error" role="alert">名单中没有可添加的新博主，请检查重复链接。</p> : null}{submitError ? <p className="field-error" role="alert">{submitError}</p> : null}</div> : null}<div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit" disabled={submitting}><UserCirclePlus size={18} aria-hidden="true" />确认添加</button></div></form></Modal>;
 }
 
-function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (video: VideoItem) => boolean; creators: Creator[] }) {
+function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (video: VideoItem) => string | null; creators: Creator[] }) {
   const metadataMessageId = useId();
   const formErrorId = useId();
   const creatorErrorId = useId();
@@ -360,6 +377,9 @@ function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (v
   const [metadataState, setMetadataState] = useState<"idle" | "loading" | "error">("idle");
   const [metadataMessage, setMetadataMessage] = useState("");
   const [formError, setFormError] = useState<{ field: "url" | "title" | "cover"; message: string } | null>(null);
+  const [submitError, setSubmitError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const submitLockRef = useRef(false);
   useEffect(() => () => metadataControllerRef.current?.abort(), []);
   const platform = detectPlatform(url);
   const eligibleCreators = useMemo(
@@ -397,21 +417,72 @@ function VideoModal({ close, onSave, creators }: { close: () => void; onSave: (v
       if (metadataControllerRef.current === controller) metadataControllerRef.current = null;
     }
   };
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    if (!platform) { setFormError({ field: "url", message: "请先输入抖音或哔站公开链接。" }); urlRef.current?.focus(); return; }
-    if (!title.trim()) { setFormError({ field: "title", message: "请填写视频标题。" }); titleRef.current?.focus(); return; }
-    if (!selectedCreator) { creatorErrorRef.current?.focus(); return; }
-    const videoUrl = normalizeUrl(url);
-    const normalizedCoverUrl = coverUrl.trim() ? normalizeUrl(coverUrl) : "";
-    if (videoUrl.length > MAX_FEED_URL_LENGTH) { setFormError({ field: "url", message: `视频链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。` }); urlRef.current?.focus(); return; }
-    if (title.trim().length > MAX_FEED_TITLE_LENGTH) { setFormError({ field: "title", message: `标题最多 ${MAX_FEED_TITLE_LENGTH.toLocaleString("zh-CN")} 个字符。` }); titleRef.current?.focus(); return; }
-    if (normalizedCoverUrl.length > MAX_FEED_URL_LENGTH) { setFormError({ field: "cover", message: `封面链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。` }); coverRef.current?.focus(); return; }
-    setFormError(null);
-    const saved = onSave({ id: makeId("manual"), platform, videoUrl, creatorId: selectedCreator.id, title: title.trim(), ...(normalizedCoverUrl ? { coverUrl: normalizedCoverUrl } : {}), ...(publishedAt ? { publishedAt } : {}), source: "manual", createdAt: new Date().toISOString() });
-    if (saved) close();
+  const resolveShortVideoLink = async (shortUrl: string, expectedPlatform: Platform) => {
+    metadataControllerRef.current?.abort();
+    const controller = new AbortController();
+    metadataControllerRef.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch("/api/metadata", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: shortUrl }), signal: controller.signal });
+      const data = await response.json() as { url?: string };
+      const resolved = typeof data.url === "string" ? normalizeUrl(data.url) : "";
+      return response.ok && resolved && isPlatformVideoUrl(resolved, expectedPlatform) ? resolved : null;
+    } catch {
+      return null;
+    } finally {
+      window.clearTimeout(timeout);
+      if (metadataControllerRef.current === controller) metadataControllerRef.current = null;
+    }
   };
-  return <Modal title="保存一个视频" description="保留原站链接和少量公开元数据，视频仍在原平台播放。" onClose={close} initialFocusRef={urlRef} className="video-modal"><form onSubmit={submit}><label className="field-label" htmlFor="video-url">视频链接</label><div className="field-with-action"><input ref={urlRef} id="video-url" type="url" value={url} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { metadataControllerRef.current?.abort(); metadataControllerRef.current = null; setUrl(event.target.value); setMetadataState("idle"); setMetadataMessage(""); setFormError(null); }} placeholder="https://www.bilibili.com/video/BV..." aria-describedby={[metadataMessage ? metadataMessageId : "", formError?.field === "url" ? formErrorId : ""].filter(Boolean).join(" ") || undefined} aria-invalid={(metadataState === "error" && !platform) || formError?.field === "url"} required /><button className="secondary-button" type="button" onClick={() => void fetchMetadata()} disabled={metadataState === "loading"}>{metadataState === "loading" ? <CircleNotch className="spin" size={17} aria-hidden="true" /> : <MagnifyingGlass size={17} aria-hidden="true" />}读取信息</button></div>{metadataMessage ? <p id={metadataMessageId} className={`field-hint ${metadataState === "error" ? "has-error" : ""}`} role={metadataState === "error" ? "alert" : "status"}>{metadataMessage}</p> : null}{formError?.field === "url" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}<label className="field-label" htmlFor="video-title">标题</label><input ref={titleRef} id="video-title" value={title} maxLength={MAX_FEED_TITLE_LENGTH} onChange={(event) => { setTitle(event.target.value); setFormError(null); }} placeholder="视频标题" aria-invalid={formError?.field === "title"} aria-describedby={formError?.field === "title" ? formErrorId : undefined} required />{formError?.field === "title" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}<label className="field-label" htmlFor="video-creator">归属博主</label><select id="video-creator" value={selectedCreator?.id ?? ""} onChange={(event) => setCreatorId(event.target.value)} disabled={!eligibleCreators.length} aria-describedby={creatorError ? creatorErrorId : undefined}><option value="">选择同平台关注博主</option>{eligibleCreators.map((creator) => <option key={creator.id} value={creator.id}>{creator.name} · {platformLabel(creator.platform)}</option>)}</select>{creatorError ? <p ref={creatorErrorRef} id={creatorErrorId} className="field-error" role="alert" tabIndex={-1}>{creatorError}</p> : null}<div className="field-grid"><div><label className="field-label" htmlFor="video-cover">封面链接（可选）</label><input ref={coverRef} id="video-cover" type="url" value={coverUrl} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { setCoverUrl(event.target.value); setFormError(null); }} placeholder="https://..." aria-invalid={formError?.field === "cover"} aria-describedby={formError?.field === "cover" ? formErrorId : undefined} />{formError?.field === "cover" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}</div><div><label className="field-label" htmlFor="video-date">发布时间（可选）</label><input id="video-date" type="date" value={publishedAt} onChange={(event) => setPublishedAt(event.target.value)} /></div></div><div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit"><ListPlus size={18} aria-hidden="true" />保存视频</button></div></form></Modal>;
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (submitLockRef.current) return;
+    if (!platform) { setFormError({ field: "url", message: "请先输入抖音或哔站公开链接。" }); setSubmitError(""); urlRef.current?.focus(); return; }
+    if (!title.trim()) { setFormError({ field: "title", message: "请填写视频标题。" }); setSubmitError(""); titleRef.current?.focus(); return; }
+    if (!selectedCreator) { creatorErrorRef.current?.focus(); return; }
+    let videoUrl = normalizeUrl(url);
+    if (!isPlatformVideoUrl(videoUrl, platform)) {
+      // Share buttons produce short links; resolve them so the documented
+      // "metadata failed, fill it in manually" path still works.
+      if (!isResolvableShortVideoLink(videoUrl)) {
+        setFormError({ field: "url", message: "请粘贴抖音或哔站的视频详情链接（分享短链接会先自动解析）。" });
+        setSubmitError("");
+        urlRef.current?.focus();
+        return;
+      }
+      const requestedPlatform = platform;
+      submitLockRef.current = true;
+      setSubmitting(true);
+      setMetadataState("loading");
+      setMetadataMessage("正在解析分享短链接");
+      const resolved = await resolveShortVideoLink(videoUrl, requestedPlatform);
+      setMetadataState("idle");
+      setMetadataMessage(resolved ? "已解析为视频详情链接" : "");
+      submitLockRef.current = false;
+      setSubmitting(false);
+      if (!resolved) {
+        setFormError({ field: "url", message: "短链接解析失败，请先点击「读取信息」，或直接粘贴完整的视频详情链接。" });
+        setSubmitError("");
+        urlRef.current?.focus();
+        return;
+      }
+      videoUrl = resolved;
+      setUrl(resolved);
+    }
+    const normalizedCoverUrl = normalizeOptionalMediaUrl(coverUrl);
+    if (videoUrl.length > MAX_FEED_URL_LENGTH) { setFormError({ field: "url", message: `视频链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。` }); setSubmitError(""); urlRef.current?.focus(); return; }
+    if (title.trim().length > MAX_FEED_TITLE_LENGTH) { setFormError({ field: "title", message: `标题最多 ${MAX_FEED_TITLE_LENGTH.toLocaleString("zh-CN")} 个字符。` }); setSubmitError(""); titleRef.current?.focus(); return; }
+    if (normalizedCoverUrl === null) { setFormError({ field: "cover", message: "请输入有效的 http(s) 封面链接，或留空。" }); setSubmitError(""); coverRef.current?.focus(); return; }
+    if (normalizedCoverUrl.length > MAX_FEED_URL_LENGTH) { setFormError({ field: "cover", message: `封面链接最多 ${MAX_FEED_URL_LENGTH.toLocaleString("zh-CN")} 个字符。` }); setSubmitError(""); coverRef.current?.focus(); return; }
+    setFormError(null);
+    setSubmitError("");
+    submitLockRef.current = true;
+    setSubmitting(true);
+    const error = onSave({ id: makeId("manual"), platform, videoUrl, creatorId: selectedCreator.id, title: title.trim(), ...(normalizedCoverUrl ? { coverUrl: normalizedCoverUrl } : {}), ...(publishedAt ? { publishedAt } : {}), source: "manual", createdAt: new Date().toISOString() });
+    if (error) { submitLockRef.current = false; setSubmitting(false); setSubmitError(error); return; }
+    close();
+  };
+  return <Modal title="保存一个视频" description="保留原站链接和少量公开元数据，视频仍在原平台播放。" onClose={close} initialFocusRef={urlRef} className="video-modal"><form onSubmit={submit}><label className="field-label" htmlFor="video-url">视频链接</label><div className="field-with-action"><input ref={urlRef} id="video-url" type="url" value={url} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { metadataControllerRef.current?.abort(); metadataControllerRef.current = null; setUrl(event.target.value); setMetadataState("idle"); setMetadataMessage(""); setFormError(null); setSubmitError(""); }} placeholder="https://www.bilibili.com/video/BV..." aria-describedby={[metadataMessage ? metadataMessageId : "", formError?.field === "url" ? formErrorId : ""].filter(Boolean).join(" ") || undefined} aria-invalid={(metadataState === "error" && !platform) || formError?.field === "url"} required /><button className="secondary-button" type="button" onClick={() => void fetchMetadata()} disabled={metadataState === "loading"}>{metadataState === "loading" ? <CircleNotch className="spin" size={17} aria-hidden="true" /> : <MagnifyingGlass size={17} aria-hidden="true" />}读取信息</button></div>{metadataMessage ? <p id={metadataMessageId} className={`field-hint ${metadataState === "error" ? "has-error" : ""}`} role={metadataState === "error" ? "alert" : "status"}>{metadataMessage}</p> : null}{formError?.field === "url" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}<label className="field-label" htmlFor="video-title">标题</label><input ref={titleRef} id="video-title" value={title} maxLength={MAX_FEED_TITLE_LENGTH} onChange={(event) => { setTitle(event.target.value); setFormError(null); setSubmitError(""); }} placeholder="视频标题" aria-invalid={formError?.field === "title"} aria-describedby={formError?.field === "title" ? formErrorId : undefined} required />{formError?.field === "title" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}<label className="field-label" htmlFor="video-creator">归属博主</label><select id="video-creator" value={selectedCreator?.id ?? ""} onChange={(event) => setCreatorId(event.target.value)} disabled={!eligibleCreators.length} aria-describedby={creatorError ? creatorErrorId : undefined}><option value="">选择同平台关注博主</option>{eligibleCreators.map((creator) => <option key={creator.id} value={creator.id}>{creator.name} · {platformLabel(creator.platform)}</option>)}</select>{creatorError ? <p ref={creatorErrorRef} id={creatorErrorId} className="field-error" role="alert" tabIndex={-1}>{creatorError}</p> : null}<div className="field-grid"><div><label className="field-label" htmlFor="video-cover">封面链接（可选）</label><input ref={coverRef} id="video-cover" type="url" value={coverUrl} maxLength={MAX_FEED_URL_LENGTH} onChange={(event) => { setCoverUrl(event.target.value); setFormError(null); setSubmitError(""); }} placeholder="https://..." aria-invalid={formError?.field === "cover"} aria-describedby={formError?.field === "cover" ? formErrorId : undefined} />{formError?.field === "cover" ? <p id={formErrorId} className="field-error" role="alert">{formError.message}</p> : null}</div><div><label className="field-label" htmlFor="video-date">发布时间（可选）</label><input id="video-date" type="date" value={publishedAt} onChange={(event) => setPublishedAt(event.target.value)} /></div></div>{submitError ? <p className="field-error" role="alert">{submitError}</p> : null}<div className="modal-actions"><button className="secondary-button" type="button" onClick={close}>取消</button><button className="primary-button" type="submit" disabled={submitting}><ListPlus size={18} aria-hidden="true" />保存视频</button></div></form></Modal>;
 }
 
 function ConfirmModal({ title, description, confirmLabel, onClose, onConfirm }: { title: string; description: string; confirmLabel: string; onClose: () => void; onConfirm: () => void }) {
@@ -444,9 +515,11 @@ function PageFrame({ active, children, openCreator, openVideo, settingsOpen, set
 }
 
 function RecentView({ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: FrameProps) {
-  const { creators, videos, isHydrated, setVideos, syncFeed } = useFeed();
+  const { creators, videos, isHydrated, setVideos, getDataEpoch, syncFeed } = useFeed();
   const { preferences, setVideoView } = useUiPreferences();
   const { showNotice, clearNotice } = useNotice();
+  const creatorsRef = useRef(creators);
+  useEffect(() => { creatorsRef.current = creators; }, [creators]);
   const [platform, setPlatform] = useState<PlatformFilter>("all");
   const [query, setQuery] = useState("");
   const [visibleCount, setVisibleCount] = useState(VISIBLE_VIDEO_BATCH_SIZE);
@@ -462,15 +535,18 @@ function RecentView({ openCreator, openVideo, settingsOpen, setSettingsOpen, onE
   const today = new Date(now).toDateString();
   const yesterday = new Date(now - DAY_MS).toDateString();
   const latestSync = Math.max(...creators.map((creator) => parsePublishedAt(creator.lastSyncAt)?.getTime() ?? 0), 0);
-  const removeVideo = (video: VideoItem) => removeSavedVideo(video, setVideos, showNotice, clearNotice);
+  const removeVideo = (video: VideoItem) => removeSavedVideo(video, setVideos, getDataEpoch, () => creatorsRef.current.some((creator) => creator.id === video.creatorId && creator.platform === video.platform), showNotice, clearNotice);
   if (!isHydrated) return <PageFrame active="recent" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><LoadingState /></PageFrame>;
   const emptyKind: EmptyKind = !creators.length ? "no-creators" : !recentBase.length ? "no-recent" : query.trim() ? "no-match" : platform !== "all" ? "no-platform" : "no-match";
   return <PageFrame active="recent" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><PageHeader eyebrow="FOLLOWING FEED" title="最近更新" subtitle="最近 7 天 · 按发布时间排序" stat={`${formatCount(filtered.length)} 条结果 · ${new Set(filtered.map((video) => video.creatorId)).size} 位博主 · 最近同步 ${formatDateTime(latestSync ? new Date(latestSync).toISOString() : undefined)}`} action={<button className="primary-button" type="button" onClick={openCreator}><Plus size={18} aria-hidden="true" />添加博主</button>} /><div className="content-toolbar"><PlatformTabs value={platform} onChange={(value) => { setPlatform(value); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} counts={counts} /><SearchBox value={query} onChange={(value) => { setQuery(value); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} placeholder="搜索博主或视频" /><ViewModeToggle value={preferences.videoView} onChange={setVideoView} /></div>{filtered.length === 0 ? <EmptyState kind={emptyKind} onAdd={openCreator} onSync={() => void syncFeed()} onClear={() => { setQuery(""); setPlatform("all"); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} query={query} platform={platform} /> : <section className="feed-section"><div className="section-heading-row"><div><h2>本周更新</h2><span className="section-subtitle">平台总数 {formatCount(counts.all)} · 当前显示 {formatCount(filtered.length)}</span></div><button className="quiet-action" type="button" onClick={() => setSettingsOpen(true)}><GearSix size={17} aria-hidden="true" />管理数据</button></div>{Object.entries(groups).map(([key, items]) => <div className="date-group" key={key}><h3><CalendarBlank size={16} aria-hidden="true" />{key === "unknown" ? "日期未知" : key === today ? "今天" : key === yesterday ? "昨天" : formatDate(items[0].publishedAt)}</h3><div className={`video-grid ${preferences.videoView === "list" ? "is-list" : ""}`}>{items.map((video) => { const creator = creatorById.get(video.creatorId); return creator ? <VideoCard key={video.id} video={video} creator={creator} view={preferences.videoView} onDelete={video.source === "manual" || video.source === "public-metadata" ? removeVideo : undefined} /> : null; })}</div></div>)}{displayed.length < filtered.length ? <div className="load-more-row"><button className="secondary-button" type="button" onClick={() => setVisibleCount((count) => count + VISIBLE_VIDEO_BATCH_SIZE)}>加载更多<span>还剩 {formatCount(filtered.length - displayed.length)} 条</span></button></div> : null}</section>}</PageFrame>;
 }
 
 function FollowingView({ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: FrameProps) {
-  const { creators, videos, isHydrated, setCreators, setVideos, syncFeed, syncStatus } = useFeed();
-  const { showNotice, clearNotice } = useNotice();
+  const { creators, videos, isHydrated, setCreators, setVideos, getDataEpoch, syncFeed, syncStatus } = useFeed();
+  const { showNotice, clearNotice, clearAllNotices } = useNotice();
+  const creatorsRef = useRef(creators);
+  const videosRef = useRef(videos);
+  useEffect(() => { creatorsRef.current = creators; videosRef.current = videos; }, [creators, videos]);
   const [platform, setPlatform] = useState<PlatformFilter>("all");
   const [status, setStatus] = useState<CreatorStatusFilter>("all");
   const [query, setQuery] = useState("");
@@ -479,22 +555,55 @@ function FollowingView({ openCreator, openVideo, settingsOpen, setSettingsOpen, 
   const counts = useMemo(() => ({ all: creators.length, douyin: creators.filter((creator) => creator.platform === "douyin").length, bilibili: creators.filter((creator) => creator.platform === "bilibili").length }), [creators]);
   const statusCounts = useMemo(() => ({ all: creators.length, unsynced: creators.filter((creator) => !creator.lastSyncAt && !creator.syncError).length, failed: creators.filter((creator) => Boolean(creator.syncError)).length, paused: creators.filter((creator) => !creator.enabled).length }), [creators]);
   const filtered = useMemo(() => { const needle = query.trim().toLocaleLowerCase(); return creators.filter((creator) => platformMatches(platform, creator.platform)).filter((creator) => status === "all" || status === "unsynced" && !creator.lastSyncAt && !creator.syncError || status === "failed" && Boolean(creator.syncError) || status === "paused" && !creator.enabled).filter((creator) => !needle || creator.name.toLocaleLowerCase().includes(needle)).sort((a, b) => (stats.latestMsById.get(b.id) ?? Number.NEGATIVE_INFINITY) - (stats.latestMsById.get(a.id) ?? Number.NEGATIVE_INFINITY)); }, [creators, platform, query, stats.latestMsById, status]);
-  const unfollow = useCallback((creator: Creator) => { const snapshot = { creator, videos: videos.filter((video) => video.creatorId === creator.id) }; setCreators((current) => current.filter((item) => item.id !== creator.id)); setVideos((current) => current.filter((video) => video.creatorId !== creator.id)); setConfirmCreator(null); let noticeId = ""; const undo = () => { setCreators((current) => current.some((item) => item.id === snapshot.creator.id) ? current : [...current, snapshot.creator]); setVideos((current) => { const known = new Set(current.map((video) => video.id)); return [...current, ...snapshot.videos.filter((video) => !known.has(video.id))]; }); clearNotice(noticeId); }; noticeId = showNotice({ kind: "success", text: `已取消关注 ${creator.name}`, action: { label: "撤销", onClick: undo } }, 10_000); }, [clearNotice, setCreators, setVideos, showNotice, videos]);
+  const unfollow = useCallback((creator: Creator) => {
+    clearAllNotices();
+    const snapshot = { creator, videos: videos.filter((video) => video.creatorId === creator.id) };
+    const expectedCreatorIds = new Set(creators.filter((item) => item.id !== creator.id).map((item) => item.id));
+    const expectedVideoIds = new Set(videos.filter((video) => video.creatorId !== creator.id).map((video) => video.id));
+    setCreators((current) => current.filter((item) => item.id !== creator.id));
+    setVideos((current) => current.filter((video) => video.creatorId !== creator.id));
+    const removalEpoch = getDataEpoch();
+    setConfirmCreator(null);
+    let noticeId = "";
+    const undo = () => {
+      const currentCreators = creatorsRef.current;
+      const currentVideos = videosRef.current;
+      const identityKey = getFeedCreatorIdentityKey(snapshot.creator.profileUrl, snapshot.creator.platform);
+      const canRestore = getDataEpoch() === removalEpoch
+        && sameEntityIds(currentCreators, expectedCreatorIds)
+        && sameEntityIds(currentVideos, expectedVideoIds)
+        && !currentCreators.some((item) => getFeedCreatorIdentityKey(item.profileUrl, item.platform) === identityKey);
+      if (!canRestore) {
+        clearNotice(noticeId);
+        showNotice({ kind: "info", text: "本地数据已变化，无法撤销这项操作" });
+        return;
+      }
+      setCreators((current) => current.some((item) => item.id === snapshot.creator.id) ? current : [...current, snapshot.creator]);
+      setVideos((current) => {
+        const known = new Set(current.map((video) => video.id));
+        return [...current, ...snapshot.videos.filter((video) => !known.has(video.id))];
+      });
+      clearNotice(noticeId);
+    };
+    noticeId = showNotice({ kind: "success", text: `已取消关注 ${creator.name}`, action: { label: "撤销", onClick: undo } }, 10_000);
+  }, [clearAllNotices, clearNotice, creators, getDataEpoch, setCreators, setVideos, showNotice, videos]);
   if (!isHydrated) return <PageFrame active="following" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><LoadingState /></PageFrame>;
   const kind: EmptyKind = !creators.length ? "no-creators" : "no-following-match";
   return <PageFrame active="following" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><PageHeader eyebrow="YOUR SOURCES" title="关注列表" subtitle="管理你正在关注的所有博主" stat={`${formatCount(creators.length)} 位博主 · 抖音 ${formatCount(counts.douyin)} · 哔站 ${formatCount(counts.bilibili)}`} action={<button className="primary-button" type="button" onClick={openCreator}><Plus size={18} aria-hidden="true" />添加博主</button>} /><div className="content-toolbar content-toolbar-following"><PlatformTabs value={platform} onChange={setPlatform} counts={counts} /><StatusTabs value={status} onChange={setStatus} counts={statusCounts} /><SearchBox value={query} onChange={setQuery} placeholder="搜索博主" /></div><section className="creator-list-page"><div className="section-heading-row"><div><h2>全部关注</h2><span className="section-subtitle">暂停会保留缓存；取消关注会删除本地视频</span></div><button className="quiet-action" type="button" onClick={() => void syncFeed()} disabled={syncStatus === "loading"}><ArrowsClockwise size={17} aria-hidden="true" />{syncStatus === "loading" ? "同步中" : "全部同步"}</button></div>{filtered.length ? <div className="creator-list">{filtered.map((creator) => { const creatorVideoCount = stats.countById.get(creator.id) ?? 0; const latest = stats.latestById.get(creator.id); return <article className={`creator-list-card ${creator.enabled ? "" : "is-paused"}`} key={creator.id}><Link href={`/creator/${creator.id}`} className="creator-list-main" aria-label={`查看${creator.name}的个人页`}><Avatar creator={creator} size="large" /><span className="creator-list-copy"><strong>{creator.name}</strong><span><i className={`platform-dot ${platformClass(creator.platform)}`} />{platformLabel(creator.platform)} · {formatCount(creatorVideoCount)} 条视频 · 最近 {formatLongDate(latest)}</span><small>{creator.syncError ? `同步失败：${creator.syncError}` : creator.lastSyncAt ? `最后同步 ${formatDateTime(creator.lastSyncAt)}` : "尚未同步"}</small></span><ArrowUpRight size={18} aria-hidden="true" /></Link><div className="creator-list-status">{creator.enabled ? <span className="status-badge">已启用</span> : <span className="status-badge is-paused">已暂停</span>}{creator.syncError ? <span className="status-badge is-error">失败</span> : null}</div><div className="creator-list-actions"><a className="icon-button compact" href={creator.profileUrl} target="_blank" rel="noreferrer" aria-label={`打开${creator.name}的原平台主页`} title="打开原主页"><ArrowUpRight size={17} aria-hidden="true" /></a><button className="secondary-button compact-action" type="button" onClick={() => setCreators((current) => current.map((item) => item.id === creator.id ? { ...item, enabled: !item.enabled } : item))}>{creator.enabled ? "暂停" : "恢复"}</button><button className="secondary-button compact-action" type="button" onClick={() => void syncFeed([creator])} disabled={!creator.enabled || syncStatus === "loading"}><ArrowsClockwise size={16} aria-hidden="true" />重试</button><button className="icon-button compact danger-icon" type="button" onClick={() => setConfirmCreator(creator)} disabled={syncStatus === "loading"} aria-label={`取消关注${creator.name}`} title={`取消关注${creator.name}`}><Trash size={17} aria-hidden="true" /></button></div></article>; })}</div> : <EmptyState kind={kind} onAdd={openCreator} onSync={() => void syncFeed()} onClear={() => { setQuery(""); setStatus("all"); setPlatform("all"); }} query={query} platform={platform} />}</section>{confirmCreator ? <ConfirmModal title="取消关注" description={`将删除“${confirmCreator.name}”以及该博主的 ${formatCount(stats.countById.get(confirmCreator.id) ?? 0)} 条本地视频缓存。完成后可以在 10 秒内撤销。`} confirmLabel="确认取消关注" onClose={() => setConfirmCreator(null)} onConfirm={() => unfollow(confirmCreator)} /> : null}</PageFrame>;
 }
 
 function CreatorDetail({ creatorId, openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: FrameProps & { creatorId: string }) {
-  const { creators, videos, isHydrated, setVideos, syncFeed, syncStatus } = useFeed();
+  const { creators, videos, isHydrated, setVideos, getDataEpoch, syncFeed, syncStatus } = useFeed();
   const { preferences, setVideoView } = useUiPreferences();
   const { showNotice, clearNotice } = useNotice();
+  const creatorsRef = useRef(creators);
+  useEffect(() => { creatorsRef.current = creators; }, [creators]);
   const creator = creators.find((item) => item.id === creatorId);
   const [query, setQuery] = useState("");
   const [visibleCount, setVisibleCount] = useState(VISIBLE_VIDEO_BATCH_SIZE);
   const allVideos = useMemo(() => sortVideos(videos.filter((video) => video.creatorId === creatorId)), [creatorId, videos]);
   const filtered = useMemo(() => { const needle = query.trim().toLocaleLowerCase(); return needle ? allVideos.filter((video) => video.title.toLocaleLowerCase().includes(needle)) : allVideos; }, [allVideos, query]);
-  const removeVideo = (video: VideoItem) => removeSavedVideo(video, setVideos, showNotice, clearNotice);
+  const removeVideo = (video: VideoItem) => removeSavedVideo(video, setVideos, getDataEpoch, () => creatorsRef.current.some((creator) => creator.id === video.creatorId && creator.platform === video.platform), showNotice, clearNotice);
   if (!isHydrated) return <PageFrame active="following" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><LoadingState /></PageFrame>;
   if (!creator) return <PageFrame active="following" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><div className="not-found-state"><span className="empty-icon"><UserCirclePlus size={30} aria-hidden="true" /></span><h1>博主不存在或已取消关注</h1><p>这条个人页只在当前浏览器的关注名单里有效。</p><Link className="secondary-button" href="/following"><ArrowLeft size={18} aria-hidden="true" />返回关注列表</Link></div></PageFrame>;
   const displayed = filtered.slice(0, visibleCount);
@@ -507,7 +616,10 @@ export function VideoHub({ view = "recent", creatorId }: { view?: HubView; creat
   const [pendingBackup, setPendingBackup] = useState<FeedState | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const { creators, videos, dataAvailable, replaceState, setVideos, setCreators, storageStatus, syncStatus } = useFeed();
-  const { showNotice } = useNotice();
+  const { showNotice, clearAllNotices } = useNotice();
+  const creatorsRef = useRef(creators);
+  const videosRef = useRef(videos);
+  useEffect(() => { creatorsRef.current = creators; videosRef.current = videos; }, [creators, videos]);
   const storageUnavailable = storageStatus === "read-error" || storageStatus === "write-error" || storageStatus === "conflict";
   const dataReady = dataAvailable && !storageUnavailable;
   const openCreator = useCallback(() => { if (!dataReady) return; setSettingsOpen(false); setModal("creator"); }, [dataReady]);
@@ -515,46 +627,41 @@ export function VideoHub({ view = "recent", creatorId }: { view?: HubView; creat
   const onExport = useCallback(() => { const payload = { version: 2, exportedAt: new Date().toISOString(), creators, videos }; const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }); if (blob.size > MAX_BACKUP_FILE_BYTES) { showNotice({ kind: "error", text: "当前数据超过 64 MB 备份上限，请先减少本地视频数量" }); return; } const link = document.createElement("a"); const objectUrl = URL.createObjectURL(blob); link.href = objectUrl; link.download = `just-follow-feed-${new Date().toISOString().slice(0, 10)}.json`; link.click(); window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000); showNotice({ kind: "success", text: "备份已导出" }); }, [creators, showNotice, videos]);
   const onImport = useCallback(() => fileRef.current?.click(), []);
   const onFileChange = useCallback(async (event: ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0]; event.target.value = ""; if (!file) return; if (syncStatus === "loading") { showNotice({ kind: "info", text: "同步进行中，请完成或取消同步后再导入备份" }); return; } if (file.size > MAX_BACKUP_FILE_BYTES) { showNotice({ kind: "error", text: "备份文件超过 64 MB，已停止读取" }); return; } try { const parsed = JSON.parse(await file.text()); const state = migrateFeedState(parsed); if (!state) throw new Error("备份格式不受支持、数据超限或存在损坏记录"); setSettingsOpen(false); setPendingBackup(state); } catch (error) { showNotice({ kind: "error", text: error instanceof Error ? error.message : "备份文件无法读取" }); } }, [showNotice, syncStatus]);
-  const confirmImport = useCallback(() => { if (!pendingBackup || syncStatus === "loading") return; replaceState(pendingBackup); setPendingBackup(null); setSettingsOpen(false); showNotice({ kind: "success", text: `已导入 ${pendingBackup.creators.length} 位博主和 ${pendingBackup.videos.length} 条视频` }); }, [pendingBackup, replaceState, showNotice, syncStatus]);
+  const confirmImport = useCallback(() => { if (!pendingBackup || syncStatus === "loading") return; clearAllNotices(); replaceState(pendingBackup); setPendingBackup(null); setSettingsOpen(false); showNotice({ kind: "success", text: `已导入 ${pendingBackup.creators.length} 位博主和 ${pendingBackup.videos.length} 条视频` }); }, [clearAllNotices, pendingBackup, replaceState, showNotice, syncStatus]);
   const clearAll = useCallback(() => { if (!dataReady || syncStatus === "loading") return; setModal("clear"); }, [dataReady, syncStatus]);
-  const confirmClear = useCallback(() => { if (!dataReady) return; replaceState({ version: 2, creators: [], videos: [] }); setModal(null); setSettingsOpen(false); showNotice({ kind: "success", text: "本地数据已清空" }); }, [dataReady, replaceState, showNotice]);
+  const confirmClear = useCallback(() => { if (!dataReady) return; clearAllNotices(); replaceState({ version: 2, creators: [], videos: [] }); setModal(null); setSettingsOpen(false); showNotice({ kind: "success", text: "本地数据已清空" }); }, [clearAllNotices, dataReady, replaceState, showNotice]);
   const existingUrls = useMemo(() => new Set(creators.map((creator) => getFeedCreatorIdentityKey(creator.profileUrl, creator.platform))), [creators]);
   const addCreators = useCallback((items: CreatorDraft[]) => {
     if (!dataReady) return "本地数据尚未就绪，请先完成恢复";
     const validItems = items.filter((item) => isPlatformProfileUrl(item.profileUrl, item.platform));
     if (validItems.length !== items.length) return "名单中包含非博主主页链接，请检查后重试";
-    const knownUrls = new Set(existingUrls);
-    const additions = validItems.flatMap((item) => {
-      const urlKey = getFeedCreatorIdentityKey(item.profileUrl, item.platform);
-      if (knownUrls.has(urlKey)) return [];
-      knownUrls.add(urlKey);
-      return [{ ...item, id: makeId("creator"), enabled: true }];
-    });
-    if (!additions.length) return "这些主页都已经在关注名单里了";
-    if (creators.length + additions.length > MAX_FEED_CREATORS) return `关注博主最多保存 ${MAX_FEED_CREATORS.toLocaleString("zh-CN")} 位，请先清理旧名单`;
-    setCreators((current) => [...current, ...additions]);
-    showNotice({ kind: "success", text: `已添加 ${additions.length} 位博主` });
+    const currentCreators = creatorsRef.current;
+    const result = appendUniqueCreators(currentCreators, validItems, () => makeId("creator"));
+    if (currentCreators.length + result.added > MAX_FEED_CREATORS) return `关注博主最多保存 ${MAX_FEED_CREATORS.toLocaleString("zh-CN")} 位，请先清理旧名单`;
+    if (!result.added) return "这些主页都已经在关注名单里了";
+    setCreators(result.next);
+    showNotice({ kind: "success", text: `已添加 ${result.added} 位博主` });
     return null;
-  }, [creators.length, dataReady, existingUrls, setCreators, showNotice]);
+  }, [dataReady, setCreators, showNotice]);
   const saveVideo = useCallback((video: VideoItem) => {
     if (!dataReady) {
       showNotice({ kind: "error", text: "本地数据尚未就绪，请先完成恢复" });
-      return false;
+      return "本地数据尚未就绪，请先完成恢复";
     }
-    const creator = creators.find((item) => item.id === video.creatorId);
+    const creator = creatorsRef.current.find((item) => item.id === video.creatorId);
     if (!creator || creator.platform !== video.platform || !isPlatformVideoUrl(video.videoUrl, video.platform)) {
       showNotice({ kind: "error", text: "视频链接与归属博主的平台不一致，未保存" });
-      return false;
+      return "视频链接与归属博主的平台不一致，未保存";
     }
-    const videoUrlKey = getFeedVideoIdentityKey(video.videoUrl, video.platform);
-    if (videos.some((entry) => getFeedVideoIdentityKey(entry.videoUrl, entry.platform) === videoUrlKey)) {
+    const result = appendUniqueVideo(videosRef.current, video);
+    if (!result.added) {
       showNotice({ kind: "info", text: "这个视频已经在本地保存" });
-      return false;
+      return "这个视频已经在本地保存";
     }
-    setVideos((current) => [...current, video]);
-    showNotice({ kind: "success", text: "视频已保存" });
-    return true;
-  }, [creators, dataReady, setVideos, showNotice, videos]);
+    setVideos(result.next);
+    showNotice({ kind: "success", text: video.publishedAt ? "视频已保存" : "视频已保存（未填发布时间，只会出现在博主个人页，不进“最近更新”）" });
+    return null;
+  }, [dataReady, setVideos, showNotice]);
   const frameProps = { openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear: clearAll };
   return <>{creatorId ? <CreatorDetail creatorId={creatorId} {...frameProps} /> : view === "following" ? <FollowingView {...frameProps} /> : <RecentView {...frameProps} />}{modal === "creator" ? <CreatorModal close={() => setModal(null)} onAdd={addCreators} existingUrls={existingUrls} /> : null}{modal === "video" ? <VideoModal close={() => setModal(null)} onSave={saveVideo} creators={creators} /> : null}{modal === "clear" ? <ConfirmModal title="清空本地数据" description="将删除所有关注博主、视频缓存和同步状态，此操作无法撤销。" confirmLabel="确认清空" onClose={() => setModal(null)} onConfirm={confirmClear} /> : null}{pendingBackup ? <ConfirmModal title="导入备份" description={`将用备份中的 ${pendingBackup.creators.length} 位博主和 ${pendingBackup.videos.length} 条视频替换当前数据。`} confirmLabel="确认导入" onClose={() => setPendingBackup(null)} onConfirm={confirmImport} /> : null}<input ref={fileRef} className="visually-hidden" type="file" tabIndex={-1} accept="application/json,.json" onChange={onFileChange} aria-label="选择备份文件" /></>;
 }

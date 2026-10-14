@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { extractBvidFromPathname } from "@/lib/bilibili-id";
 import { LocalApiRequestError, readLocalJsonRequest } from "@/lib/local-api-request";
 
 export const runtime = "nodejs";
@@ -34,7 +35,7 @@ function isDirectVideoTarget(url: URL) {
   if (url.hostname === "b23.tv" || url.hostname.endsWith(".b23.tv")) return false;
   if (url.hostname === "v.douyin.com") return false;
   if (url.hostname === "bilibili.com" || url.hostname.endsWith(".bilibili.com")) {
-    return /^\/video\/BV[0-9A-Za-z]{8,20}(?:\/|$)/i.test(url.pathname);
+    return Boolean(extractBvidFromPathname(url.pathname));
   }
   return /^\/video\/\d{10,}(?:\/|$)/.test(url.pathname);
 }
@@ -62,42 +63,66 @@ function readMeta(html: string, key: string) {
 
 function decodeEntities(value: string) {
   return value
-    .replace(/&amp;/g, "&")
+    .replace(/&#x([0-9a-f]{1,6});/gi, (_, hex: string) => codePointToString(Number.parseInt(hex, 16)))
+    .replace(/&#(\d{1,7});/g, (_, decimal: string) => codePointToString(Number(decimal)))
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
     .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+    .replace(/&gt;/g, ">")
+    // Ampersands are decoded last so "&amp;lt;" becomes "&lt;" instead of "<".
+    .replace(/&amp;/g, "&");
 }
 
-async function readLimitedText(response: Response) {
-  const contentLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > MAX_HTML_BYTES) {
-    throw new Error("页面响应过大");
+function codePointToString(value: number) {
+  if (!Number.isInteger(value) || value <= 0 || value > 0x10ffff) return "";
+  try {
+    return String.fromCodePoint(value);
+  } catch {
+    return "";
   }
+}
+
+async function discardBody(response: Response | null) {
+  try {
+    await response?.body?.cancel();
+  } catch {
+    // Releasing an unused response body is best effort only.
+  }
+}
+
+/**
+ * Reads at most MAX_HTML_BYTES of the page and stops as soon as <head> is complete.
+ * Public metadata tags live in <head>, while real Bilibili/Douyin pages are several
+ * megabytes, so a whole-body size limit would reject every real detail page.
+ */
+async function readLimitedText(response: Response) {
   if (!response.body) return "";
 
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  let text = "";
   let total = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_HTML_BYTES) throw new Error("页面响应过大");
-      chunks.push(value);
+      text += decoder.decode(value, { stream: true });
+      if (/<\/head>/i.test(text) || total >= MAX_HTML_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
     }
+    text += decoder.decode();
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
   } finally {
     reader.releaseLock();
   }
 
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(merged);
+  return text;
 }
 
 export async function POST(request: Request) {
@@ -134,6 +159,7 @@ export async function POST(request: Request) {
     );
   }
 
+  const originalTarget = target;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
 
@@ -152,21 +178,27 @@ export async function POST(request: Request) {
 
       if (![301, 302, 303, 307, 308].includes(response.status)) break;
       const location = response.headers.get("location");
-      if (!location || redirectCount === MAX_REDIRECTS) {
-        throw new Error("页面跳转次数过多");
+      await discardBody(response);
+      if (!location) throw new Error("页面跳转缺少目标地址");
+      if (redirectCount === MAX_REDIRECTS) throw new Error("页面跳转次数过多");
+      try {
+        target = new URL(location, target);
+      } catch {
+        throw new Error("页面跳转到了不支持的地址");
       }
-      target = new URL(location, target);
       if (!isSafeTarget(target)) throw new Error("页面跳转到了不支持的地址");
     }
 
     if (!response?.ok) {
+      await discardBody(response);
       return NextResponse.json(
         { error: `页面暂时无法读取（${response?.status ?? 502}）` },
         { status: 502 },
       );
     }
 
-    if (!isDirectVideoTarget(target)) {
+    if (!isDirectVideoTarget(target) && !isDirectVideoTarget(originalTarget)) {
+      await discardBody(response);
       return NextResponse.json(
         { error: "短链接没有跳转到可识别的视频详情页" },
         { status: 422 },
@@ -175,6 +207,7 @@ export async function POST(request: Request) {
 
     const contentType = response.headers.get("content-type") || "";
     if (contentType && !/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+      await discardBody(response);
       return NextResponse.json({ error: "页面不是可读取的公开网页" }, { status: 422 });
     }
 
@@ -199,11 +232,9 @@ export async function POST(request: Request) {
   } catch (error) {
     const message = error instanceof Error && error.name === "AbortError"
       ? "读取超时，请手动填写视频信息"
-      : error instanceof Error && error.message === "页面响应过大"
-        ? "页面响应过大，请手动填写视频信息"
-        : error instanceof Error && error.message.includes("跳转")
-          ? error.message
-          : "页面暂时无法读取，请手动填写视频信息";
+      : error instanceof Error && error.message.includes("跳转")
+        ? error.message
+        : "页面暂时无法读取，请手动填写视频信息";
     return NextResponse.json({ error: message }, { status: 502 });
   } finally {
     clearTimeout(timeout);

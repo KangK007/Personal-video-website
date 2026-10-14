@@ -1,6 +1,8 @@
 "use client";
 
 import type { Creator, FeedState, VideoItem } from "@/lib/feed-types";
+import { extractBvidFromPathname } from "@/lib/bilibili-id";
+import { parsePublishedAt } from "@/lib/feed-logic";
 
 const DATABASE_NAME = "just-follow-feed";
 const DATABASE_VERSION = 2;
@@ -45,6 +47,11 @@ function asOptionalString(value: unknown) {
 function asBoundedString(value: unknown, maximum: number) {
   const text = asOptionalString(value);
   return text && text.length <= maximum ? text : undefined;
+}
+
+function validDateString(value: unknown) {
+  const text = asBoundedString(value, MAX_FEED_DATE_LENGTH);
+  return text && parsePublishedAt(text) ? text : undefined;
 }
 
 function normalizeHttpUrl(value: unknown, platform?: Creator["platform"]) {
@@ -94,7 +101,7 @@ function getPlatformVideoIdentity(value: unknown, platform: VideoItem["platform"
   if (!normalized) return null;
   const url = new URL(normalized);
   const id = platform === "bilibili"
-    ? url.pathname.match(/^\/video\/(BV[0-9A-Za-z]{8,20})(?:\/|$)/i)?.[1]
+    ? extractBvidFromPathname(url.pathname)
     : url.pathname.match(/^\/video\/(\d{10,})(?:\/|$)/)?.[1];
   return id ? { id, page: platform === "bilibili" ? getBilibiliPageNumber(url) : 1 } : null;
 }
@@ -120,6 +127,7 @@ function migrateCreator(value: unknown, version: number): Creator | null {
     ? item.nameSource
     : name === fallbackName ? "fallback" : "manual";
   const avatarUrl = normalizeHttpUrl(item.avatarUrl);
+  const lastSyncAt = validDateString(item.lastSyncAt);
   return {
     id,
     platform: item.platform,
@@ -128,7 +136,7 @@ function migrateCreator(value: unknown, version: number): Creator | null {
     nameSource,
     ...(avatarUrl ? { avatarUrl } : {}),
     enabled: typeof item.enabled === "boolean" ? item.enabled : true,
-    ...(asBoundedString(item.lastSyncAt, MAX_FEED_DATE_LENGTH) ? { lastSyncAt: asBoundedString(item.lastSyncAt, MAX_FEED_DATE_LENGTH) } : {}),
+    ...(lastSyncAt ? { lastSyncAt } : {}),
     ...(asBoundedString(item.syncError, MAX_FEED_SYNC_ERROR_LENGTH) ? { syncError: asBoundedString(item.syncError, MAX_FEED_SYNC_ERROR_LENGTH) } : {}),
   };
 }
@@ -145,8 +153,9 @@ function migrateVideo(value: unknown): VideoItem | null {
   if (!creatorId) return null;
   const title = asBoundedString(item.title, MAX_FEED_TITLE_LENGTH) ?? "未命名视频";
   const source = typeof item.source === "string" && VALID_SOURCES.has(item.source) ? item.source as VideoItem["source"] : "manual";
-  const createdAt = asBoundedString(item.createdAt, MAX_FEED_DATE_LENGTH)
-    || asBoundedString(item.publishedAt, MAX_FEED_DATE_LENGTH)
+  const publishedAt = validDateString(item.publishedAt);
+  const createdAt = validDateString(item.createdAt)
+    || publishedAt
     || "1970-01-01T00:00:00.000Z";
   const coverUrl = normalizeHttpUrl(item.coverUrl);
   return {
@@ -156,7 +165,7 @@ function migrateVideo(value: unknown): VideoItem | null {
     creatorId,
     title,
     ...(coverUrl ? { coverUrl } : {}),
-    ...(asBoundedString(item.publishedAt, MAX_FEED_DATE_LENGTH) ? { publishedAt: asBoundedString(item.publishedAt, MAX_FEED_DATE_LENGTH) } : {}),
+    ...(publishedAt ? { publishedAt } : {}),
     ...(asBoundedString(item.duration, MAX_FEED_DURATION_LENGTH) ? { duration: asBoundedString(item.duration, MAX_FEED_DURATION_LENGTH) } : {}),
     source,
     createdAt,
@@ -301,7 +310,7 @@ export function isPlatformVideoUrl(value: unknown, platform: Creator["platform"]
   if (!normalized) return false;
   const pathname = new URL(normalized).pathname;
   return platform === "bilibili"
-    ? /^\/video\/BV[0-9A-Za-z]{8,20}(?:\/|$)/i.test(pathname)
+    ? Boolean(extractBvidFromPathname(pathname))
     : /^\/video\/\d{10,}(?:\/|$)/.test(pathname);
 }
 
@@ -321,13 +330,30 @@ export function isPlatformProfileUrl(value: unknown, platform: Creator["platform
 function openDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
+    let settled = false;
+    const timer = setTimeout(() => fail(new Error("本地数据库打开超时，请重试")), 15_000);
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    };
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(STORE_NAME)) {
         request.result.createObjectStore(STORE_NAME);
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("本地数据库打开失败"));
+    request.onsuccess = () => {
+      if (settled) {
+        request.result.close();
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(request.result);
+    };
+    request.onerror = () => fail(request.error ?? new Error("本地数据库打开失败"));
+    request.onblocked = () => fail(new Error("本地数据库升级被其他标签页阻塞，请关闭本站其他标签页后重试"));
   });
 }
 
@@ -380,6 +406,7 @@ export async function writeFeedState(
   videos: unknown[],
   expectedRevision: number,
   writerId: string,
+  adoptRevision = false,
 ) {
   const normalized = normalizeFeedState({ version: 2, creators, videos }, false);
   if (!normalized) throw new Error("当前数据未通过完整性校验，已停止保存");
@@ -397,7 +424,10 @@ export async function writeFeedState(
         const actualRevision = Number.isSafeInteger(rawRevision) && rawRevision >= 0
           ? rawRevision
           : 0;
-        if (actualRevision !== expectedRevision) {
+        // Explicit replacements (import backup, clear local data) adopt whatever
+        // revision is stored instead of failing when the baseline is unknown, which
+        // is always the case after a failed hydration read.
+        if (!adoptRevision && actualRevision !== expectedRevision) {
           conflict = new FeedStorageConflictError(actualRevision);
           transaction.abort();
           return;

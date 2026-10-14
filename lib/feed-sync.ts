@@ -1,5 +1,6 @@
 "use client";
 
+import { extractBvidFromPathname } from "@/lib/bilibili-id";
 import { parsePublishedAt, sortVideos } from "@/lib/feed-logic";
 import {
   getFeedVideoIdentityKey,
@@ -136,6 +137,22 @@ function createAbortError() {
     : Object.assign(new Error("同步已取消"), { name: "AbortError" });
 }
 
+/** Raised when one request consumed the whole server-side budget without answering. */
+class SyncRequestTimeoutError extends Error {
+  constructor() {
+    super("同步服务响应超时");
+    this.name = "SyncRequestTimeoutError";
+  }
+}
+
+/** Carries the HTTP status so retry decisions do not depend on message wording. */
+class SyncHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "SyncHttpError";
+  }
+}
+
 export function waitWithSignal(milliseconds: number, signal: AbortSignal) {
   if (signal.aborted) return Promise.reject(createAbortError());
   return new Promise<void>((resolve, reject) => {
@@ -160,7 +177,8 @@ export function syncRequestError(error: unknown) {
 }
 
 function isRetryableSyncRequestError(error: unknown) {
-  if (isAbortError(error)) return false;
+  if (isAbortError(error) || error instanceof SyncRequestTimeoutError) return false;
+  if (error instanceof SyncHttpError) return error.status === 408 || error.status === 429 || error.status >= 500;
   if (error instanceof TypeError) return true;
   return error instanceof Error && /HTTP (408|429|5\d\d)|返回异常|超时/.test(error.message);
 }
@@ -206,13 +224,13 @@ async function requestSyncBatchOnce(
       throw new Error(`同步服务返回异常（HTTP ${response.status}）`);
     }
     if (!response.ok && !Array.isArray(data.results)) {
-      throw new Error(data.error || `同步服务返回 HTTP ${response.status}`);
+      throw new SyncHttpError(data.error || `同步服务返回 HTTP ${response.status}`, response.status);
     }
     return data;
   } catch (error) {
     if (signal.aborted) throw createAbortError();
     if (timedOut || (isAbortError(error) && !signal.aborted)) {
-      throw new Error("同步服务响应超时");
+      throw new SyncRequestTimeoutError();
     }
     throw error;
   } finally {
@@ -273,7 +291,7 @@ function canonicalSyncVideoId(platform: Platform, videoUrl: string, fallbackId: 
   try {
     const pathname = new URL(videoUrl).pathname;
     const platformId = platform === "bilibili"
-      ? pathname.match(/^\/video\/(BV[0-9A-Za-z]{8,20})(?:\/|$)/i)?.[1]
+      ? extractBvidFromPathname(pathname)
       : pathname.match(/^\/video\/(\d+)(?:\/|$)/)?.[1];
     return platformId ? `sync-${platform}-${platformId}` : fallbackId;
   } catch {

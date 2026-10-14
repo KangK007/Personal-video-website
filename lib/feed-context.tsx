@@ -49,6 +49,7 @@ type FeedContextValue = {
   isSaving: boolean;
   setCreators: Dispatch<SetStateAction<Creator[]>>;
   setVideos: Dispatch<SetStateAction<VideoItem[]>>;
+  getDataEpoch: () => number;
   replaceState: (next: FeedState) => void;
   retryHydrate: () => void;
   retryPersist: () => void;
@@ -76,23 +77,24 @@ const EMPTY_PROGRESS: SyncProgress = {
   runId: 0,
 };
 
-function readLegacyState(): { state: FeedState | null; failed: boolean; recoveryMessage?: string } {
+function readLegacyState(): { state: FeedState | null; recoveryMessage?: string } {
   try {
     const creatorsValue = window.localStorage.getItem(LEGACY_CREATOR_STORAGE_KEY);
     const videosValue = window.localStorage.getItem(LEGACY_VIDEO_STORAGE_KEY);
-    if (creatorsValue === null && videosValue === null) return { state: null, failed: false };
+    if (creatorsValue === null && videosValue === null) return { state: null };
+    // A partially written legacy cache is best-effort input, not a reason to lock the
+    // app: the missing half is treated as empty and unusable values are ignored.
     const recovered = recoverFeedState({
       version: 1,
-      creators: JSON.parse(creatorsValue ?? "null"),
-      videos: JSON.parse(videosValue ?? "null"),
+      creators: JSON.parse(creatorsValue ?? "[]"),
+      videos: JSON.parse(videosValue ?? "[]"),
     });
     return {
       state: recovered?.state ?? null,
-      failed: !recovered,
       ...(recovered?.repaired ? { recoveryMessage: `已从旧版缓存隔离或修复 ${recovered.repaired} 条异常数据记录。` } : {}),
     };
   } catch {
-    return { state: null, failed: true };
+    return { state: null };
   }
 }
 
@@ -117,6 +119,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   const writerIdRef = useRef("");
   const channelRef = useRef<BroadcastChannel | null>(null);
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const adoptNextWriteRef = useRef(false);
   const runIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const syncingRef = useRef(false);
@@ -147,16 +150,20 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const setCreators = useCallback<Dispatch<SetStateAction<Creator[]>>>((update) => {
+    const current = creatorsRef.current;
+    const next = typeof update === "function" ? update(current) : update;
+    if (next === current) return;
     dataEpochRef.current += 1;
-    const next = typeof update === "function" ? update(creatorsRef.current) : update;
     creatorsRef.current = next;
     setCreatorsState(next);
     markDirty();
   }, [markDirty]);
 
   const setVideos = useCallback<Dispatch<SetStateAction<VideoItem[]>>>((update) => {
+    const current = videosRef.current;
+    const next = typeof update === "function" ? update(current) : update;
+    if (next === current) return;
     dataEpochRef.current += 1;
-    const next = typeof update === "function" ? update(videosRef.current) : update;
     videosRef.current = next;
     setVideosState(next);
     markDirty();
@@ -172,8 +179,13 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     setStorageStatus("ready");
     setStorageError(null);
     conflictRevisionRef.current = null;
+    // Import and clear replace the whole local dataset, so the first write may adopt
+    // the stored revision instead of failing when no readable baseline exists.
+    adoptNextWriteRef.current = true;
     markDirty();
   }, [markDirty]);
+
+  const getDataEpoch = useCallback(() => dataEpochRef.current, []);
 
   useEffect(() => {
     creatorsRef.current = creators;
@@ -194,6 +206,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       let recoveryMessage: string | undefined;
       let usedLegacyStorage = false;
       let databaseFailed = false;
+      let databaseErrorMessage: string | undefined;
       try {
         const stored = await readFeedState();
         if (stored) {
@@ -202,8 +215,11 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           needsRewrite = Boolean(stored.needsRewrite);
           recoveryMessage = stored.recoveryMessage;
         }
-      } catch {
+      } catch (error) {
         databaseFailed = true;
+        if (error instanceof Error && /其他标签页|打开超时|损坏/.test(error.message)) {
+          databaseErrorMessage = error.message;
+        }
       }
 
       if (!state) {
@@ -211,7 +227,6 @@ export function FeedProvider({ children }: { children: ReactNode }) {
         state = legacy.state;
         usedLegacyStorage = Boolean(state);
         recoveryMessage = legacy.recoveryMessage;
-        databaseFailed = databaseFailed || legacy.failed;
       }
       if (cancelled || dataEpochRef.current !== epochAtStart) return;
 
@@ -228,7 +243,9 @@ export function FeedProvider({ children }: { children: ReactNode }) {
         setVideosState(state.videos);
         setDataAvailable(true);
         setStorageStatus("ready");
-        setStorageError(recoveryMessage ?? null);
+        setStorageError(databaseFailed
+          ? `${databaseErrorMessage ?? "本地数据库暂时无法读取。"} 已先载入旧版缓存，请检查后点击重试保存。`
+          : recoveryMessage ?? null);
         if (needsRewrite || usedLegacyStorage) markDirty();
         return;
       }
@@ -236,7 +253,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       if (databaseFailed) {
         setDataAvailable(false);
         setStorageStatus("read-error");
-        setStorageError("本地数据读取失败。请重试，或导入之前导出的备份；当前缓存不会被覆盖。");
+        setStorageError(databaseErrorMessage ?? "本地数据读取失败。请重试，或导入之前导出的备份；当前缓存不会被覆盖。");
       } else {
         storageRevisionRef.current = 0;
         conflictRevisionRef.current = null;
@@ -266,6 +283,8 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       const targetVersion = persistVersionRef.current;
       const creatorSnapshot = creatorsRef.current;
       const videoSnapshot = videosRef.current;
+      const adoptRevision = adoptNextWriteRef.current;
+      adoptNextWriteRef.current = false;
       writeQueueRef.current = writeQueueRef.current.catch(() => undefined).then(async () => {
         if (syncingRef.current || targetVersion <= persistedVersionRef.current) return;
         try {
@@ -274,6 +293,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
             videoSnapshot,
             storageRevisionRef.current,
             writerIdRef.current,
+            adoptRevision,
           );
           storageRevisionRef.current = revision;
           persistedVersionRef.current = Math.max(persistedVersionRef.current, targetVersion);
@@ -421,7 +441,9 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           let data;
           try {
             data = await requestSyncBatch(batch, controller.signal, videosRef.current);
-            if (!data.configured) throw new Error(data.error || "未配置本机抓取服务，请先运行 npm run start:local");
+            if (!data.configured && !(Array.isArray(data.results) && data.results.length)) {
+              throw new Error(data.error || "未配置本机同步服务，请先运行 npm run start:local 完成配置");
+            }
             if (!Array.isArray(data.results)) throw new Error(data.error || "同步服务返回的数据不完整");
           } catch (error) {
             if (controller.signal.aborted) {
@@ -495,6 +517,8 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     if (typeof navigator === "undefined" || !("locks" in navigator)) return runSync();
     return navigator.locks.request(SYNC_LOCK_NAME, { ifAvailable: true }, async (lock) => {
       if (lock) return runSync();
+      // A second click inside this tab must not abort the run already in progress.
+      if (syncingRef.current) return false;
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
       setSyncProgress({ ...EMPTY_PROGRESS, status: "error", message: "另一个标签页正在同步，请稍后重试", runId });
@@ -505,11 +529,13 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (autoSyncStartedRef.current) return;
     if (!dataAvailable || (storageStatus !== "ready" && storageStatus !== "empty")) return;
+    // Do not consume the once-per-page-load auto sync while no creator can be synced:
+    // the first run adds creators after hydration and must still sync without a reload.
+    if (!creatorsRef.current.some((creator) => creator.enabled)) return;
 
     autoSyncStartedRef.current = true;
-    if (!creatorsRef.current.some((creator) => creator.enabled)) return;
     void syncFeed();
-  }, [dataAvailable, storageStatus, syncFeed]);
+  }, [creators, dataAvailable, storageStatus, syncFeed]);
 
   const cancelSync = useCallback(() => {
     if (!syncingRef.current) return;
@@ -533,6 +559,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     isSaving,
     setCreators,
     setVideos,
+    getDataEpoch,
     replaceState,
     retryHydrate,
     retryPersist,
@@ -547,6 +574,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     cancelSync,
     creators,
     dataAvailable,
+    getDataEpoch,
     replaceState,
     retryFailed,
     retryHydrate,

@@ -40,7 +40,9 @@ export function sortVideos(videos: VideoItem[]) {
     }))
     .sort((a, b) => {
       const publishedDiff = b.publishedAt - a.publishedAt;
-      if (publishedDiff !== 0) return publishedDiff;
+      // Two unknown dates both yield -Infinity; -Infinity - -Infinity is NaN, which
+      // would silently skip the createdAt tie-break.
+      if (publishedDiff !== 0 && !Number.isNaN(publishedDiff)) return publishedDiff;
       const createdDiff = b.createdAt - a.createdAt;
       return createdDiff !== 0 ? createdDiff : a.index - b.index;
     })

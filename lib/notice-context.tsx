@@ -33,6 +33,7 @@ type NoticeContextValue = {
   notice: Notice | null;
   showNotice: (input: NoticeInput, duration?: number) => string;
   clearNotice: (id?: string) => void;
+  clearAllNotices: () => void;
 };
 
 const DEFAULT_NOTICE_DURATION = 10_000;
@@ -70,6 +71,13 @@ export function NoticeProvider({ children }: { children: ReactNode }) {
     setNotice(next);
   }, [clearTimer]);
 
+  const clearAllNotices = useCallback(() => {
+    clearTimer();
+    queuedNoticesRef.current = [];
+    currentNoticeRef.current = null;
+    setNotice(null);
+  }, [clearTimer]);
+
   const showNotice = useCallback((input: NoticeInput, duration?: number) => {
     const effectiveDuration = duration ?? (input.kind === "error" ? 0 : DEFAULT_NOTICE_DURATION);
     const nextNotice = { ...input, id: createNoticeId(), duration: effectiveDuration };
@@ -90,7 +98,7 @@ export function NoticeProvider({ children }: { children: ReactNode }) {
     return clearTimer;
   }, [clearNotice, clearTimer, notice]);
 
-  const value = useMemo(() => ({ notice, showNotice, clearNotice }), [clearNotice, notice, showNotice]);
+  const value = useMemo(() => ({ notice, showNotice, clearNotice, clearAllNotices }), [clearAllNotices, clearNotice, notice, showNotice]);
   return <NoticeContext.Provider value={value}>{children}</NoticeContext.Provider>;
 }
 
