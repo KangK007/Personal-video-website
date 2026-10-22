@@ -4,6 +4,7 @@
 
 ```text
 app/                         Next.js App Router 页面、布局和 API Route Handler
+  api/bilibili/session       哔站 Cookie 登录态检查（同步前预检）
   api/health                 网站与本机抓取服务健康检查
   api/feed/sync              同步代理和响应归一化
   api/following              平台关注名单提取（NDJSON 流）与浏览器连接回传
@@ -15,10 +16,10 @@ components/                  页面交互组件
   VideoHub.tsx               主界面、表单、筛选、备份等交互
   FollowingCollector.tsx     关注名单提取、预览、导入导出与浏览器连接
 lib/                         客户端状态、数据模型、存储、同步和平台适配器
-  bilibili-browser.ts        用本机浏览器读取哔站关注名单
+  bilibili-browser.ts        用本机浏览器读取哔站关注名单并检查登录态
   following-list.ts          名单格式校验、TXT / JSON 导入导出
   server/                    仅服务端使用的同步与关注名单模块
-    bilibili-sync.ts         哔站投稿同步
+    bilibili-sync.ts         哔站投稿同步（分页间隔 1.2 秒）
     feed-sync-shared.ts      同步响应归一化公共函数
     following.ts             抖音 / 哔站关注名单采集器
     following-bridge.ts      一次性连接令牌与结果回传
@@ -54,18 +55,24 @@ Git 仓库只保存源码、配置模板、锁文件、测试和说明文档。�
 
 ## 当前验证基线（2026-10-22）
 
-- 单元 / 集成测试：19 个测试文件，161 个测试通过（`npm test`）。
+- 单元 / 集成测试：20 个测试文件，170 个测试通过（`npm test`）。
 - TypeScript：`npm run typecheck` 通过。
 - ESLint：`npm run lint` 通过。
-- Next.js 生产构建：`npm run build` 通过（12 条路由）。
-- 浏览器冒烟：`npm run test:e2e` 80 项、`npm run test:e2e:following` 7 项通过（需先启动生产构建、并存在 Edge 或 Chrome；见下）。
+- Next.js 生产构建：`npm run build` 通过（13 条路由）。
+- 浏览器冒烟：`npm run test:e2e` 85 项、`npm run test:e2e:following` 7 项通过（需先启动生产构建、并存在 Edge 或 Chrome；见下）。
 - 插件联动冒烟：`npm run test:e2e:extension` 9 项通过（需 `FOCUS_EXTENSION_PATH` 指向本机 FocusExtension 目录；默认路径为 `D:\浏览器插件\FocusExtension`）。
 - CI 在 Node.js 24 上运行 `npm run typecheck && npm run lint && npm test && npm run build`；浏览器冒烟不在 CI 中运行。
 - 自动化同步与关注名单提取依赖平台 Cookie、平台公开接口和本机浏览器；这些外部条件不由 CI 模拟，需在本机用真实凭据另行验证。
 
+### 同步节奏与错误恢复
+
+- 哔站：每次请求 1 位博主，博主之间 3–5 秒随机间隔，同一博主翻页间隔 1.2 秒；单轮最多 50 位，超出部分顺延到下一轮（优先失败、未同步、最久未同步的博主）。
+- 同步开始前通过 `/api/bilibili/session` 用本机浏览器检查哔站 Cookie 登录态；失效时跳过哔站博主并提示重新配置 Cookie，而不是逐条触发风控。
+- 平台返回限流时等待 20 秒重试一次；仍受限则停止该平台本轮后续请求，并把这些博主标记为“本轮未请求”（不保留历史错误、不计为失败）。连续 3 次服务不可用会提前结束本轮，剩余博主不标记为失败。
+
 ### 端到端冒烟
 
-`scripts/e2e-smoke.mjs` 覆盖首次使用、批量导入、自动同步、筛选搜索、手动保存、关注列表操作与撤销、同步失败重试、备份导出/清空/导入、个人页、主题、移动端布局、多标签页同步，以及残留旧版缓存、分享短链接和空态同步按钮等边界；其中“同步失败与重试”一段会模拟平台限流，验证本轮失败与跳过的区分、跳过博主不保留历史错误，以及“重试有错误的博主”批量恢复。平台接口（`/api/feed/sync`、`/api/metadata`）在浏览器网络层被替换为确定性桩，因此它验证的是本站行为，不是平台可用性。
+`scripts/e2e-smoke.mjs` 覆盖首次使用、批量导入、自动同步、筛选搜索、手动保存、关注列表操作与撤销、同步失败重试、备份导出/清空/导入、个人页、主题、移动端布局、多标签页同步，以及残留旧版缓存、分享短链接和空态同步按钮等边界；“同步失败与重试”一段会模拟平台限流，验证退避重试成功、持久限流下的失败与跳过区分、跳过博主不保留历史错误、Cookie 失效时的明确提示，以及“重试有错误的博主”批量恢复。平台接口（`/api/feed/sync`、`/api/metadata`、`/api/bilibili/session`）在浏览器网络层被替换为确定性桩，因此它验证的是本站行为，不是平台可用性。
 
 `scripts/following-e2e-smoke.mjs` 覆盖关注名单提取的流式预览、完整/未完整结果的选中规则、中断后的部分结果确认、追加去重、名单 JSON 导入、全站备份替换，以及从哔站 www / api 页面通过一次性连接回传名单。平台的关注接口与页面同样由桩替代。
 
