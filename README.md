@@ -10,7 +10,9 @@
 - 独立“关注列表”页面支持搜索、按平台筛选、暂停、恢复、单博主重试和取消关注后 10 秒撤销。
 - 独立博主个人页展示全部本地视频，按发布时间排序并每次加载 48 条。
 - 单个添加或按行批量导入博主；同步时尽力补充平台昵称和头像。
+- “关注列表”页可从抖音 / 哔站提取自己的平台关注名单：预览、去重、选择后追加，支持导入导出名单文件，以及从已登录的哔站页面回传名单（不读取 Cookie）。
 - 分页读取关注博主的全部公开投稿，并按时间合并去重。
+- 同步错误可恢复：平台限流时本轮只标记实际失败的博主，被跳过的博主不再长期显示为错误；关注列表提供“重试有错误的博主”，同步服务连续失败时会自动停止本轮而不是把剩余博主全部标成失败。
 - 手动保存视频链接（抖音 / 哔站分享短链接会在保存时先自动解析为详情页）；公开元数据读取失败时仍可手动填写标题。
 - IndexedDB v2 本地保存、v1 数据迁移以及 JSON v1/v2 备份导入和 v2 导出。
 - 桌面端和移动端响应式界面，支持键盘操作和深色模式。
@@ -21,7 +23,7 @@
 
 | 部分 | 作用 | 是否接触 Cookie |
 | --- | --- | --- |
-| Next.js 网站 | 展示关注流、保存名单、调用同步接口；按需启动本机 Edge 读取抖音主页 | 是，仅从 `.local/douyin-cookie.txt` 读取抖音 Cookie |
+| Next.js 网站 | 展示关注流、保存名单、调用同步接口；按需启动本机 Edge 读取抖音主页和平台关注名单 | 是，从 `.local/douyin-cookie.txt` 和 `.local/bilibili-cookie.txt` 读取对应平台 Cookie |
 | 本机抓取服务 | 通过第三方 API 服务读取哔站投稿 | 是，启动时从 `.local/bilibili-cookie.txt` 加载到内存；不写入第三方仓库配置 |
 
 不配置抓取服务时，网站仍可完整使用关注名单、平台切换、手动保存和备份功能；“同步关注流”会明确提示尚未配置。
@@ -35,7 +37,7 @@ npm ci
 npm run start:local
 ```
 
-`start:local` 会检查并启动本机抓取服务，在构建缺失或早于源码时重新构建，然后以生产模式启动 Next.js。哔站 sidecar 由轻量监督进程管理，意外退出后会自动重启；主动运行 `stop:local` 时会一并停止监督器和工作进程。并发执行多个启动命令时，后启动的命令会等待前一个完成，避免重复构建和覆盖进程记录。启动器只管理自己记录在 `.local/runtime/` 中的进程，不会结束同端口上的未知进程。默认访问地址为 `http://127.0.0.1:3000`；设置有效的 `APP_PORT` 时使用对应端口。运行日志也位于该目录。停止由此脚本启动的服务可运行 `npm run stop:local`。如果只想调试前端，可使用 `npm run dev`；普通 `dev` 和 `start` 命令默认也只监听回环地址。
+`start:local` 会检查并启动本机抓取服务，在构建缺失或早于源码时重新构建，然后以生产模式启动 Next.js。网站和哔站 sidecar 都由轻量监督进程管理，意外退出后会自动重启；主动运行 `stop:local` 时会一并停止监督器和工作进程。并发执行多个启动命令时，后启动的命令会等待前一个完成，避免重复构建和覆盖进程记录。启动器只管理自己记录在 `.local/runtime/` 中的进程，不会结束同端口上的未知进程。默认访问地址为 `http://127.0.0.1:3000`；设置有效的 `APP_PORT` 时使用对应端口。运行日志也位于该目录。停止由此脚本启动的服务可运行 `npm run stop:local`。如果只想调试前端，可使用 `npm run dev`；普通 `dev` 和 `start` 命令默认也只监听回环地址。
 
 ### 登录后自动启动与个人数据
 
@@ -153,6 +155,12 @@ https://www.douyin.com/user/...
 摄影博主 https://space.bilibili.com/123456
 ```
 
+在“关注列表”点击“从平台提取”可以自动读取抖音和哔站的已关注博主。工具分别从 `.local/douyin-cookie.txt` 与 `.local/bilibili-cookie.txt` 读取 Cookie，在临时 Edge/Chrome 会话中打开对应平台页面，再逐页读取关注接口；不复用同步投稿的 Python 抓取服务。界面显示登录账号、进度、重复项和异常；提取结果会先预览，确认后追加到本站，不会替换已有视频或暂停状态。每条名单记录包含 `platform`、`platformUserId`、`name`、`profileUrl` 和可选的 `avatarUrl`，主页链接统一为抖音 `https://www.douyin.com/user/{sec_uid}` 或哔站 `https://space.bilibili.com/{uid}`。若临时浏览器中哔站仍显示“登录”，说明保存的哔站 Cookie 已失效，需要更新 Cookie 后重试。
+
+如果当前 Edge 已经登录哔站，但保存的 Cookie 过期，可以在提取窗口点击“连接当前哔站页面”。本站会生成一次性连接脚本并尝试复制到剪贴板；切到已登录的哔站页面（也可以是 `https://api.bilibili.com/x/web-interface/nav`），在开发者工具 Console 粘贴并回车。脚本只在当前哔站页面内调用关注接口，再打开一个本站本机接收标签页，通过浏览器消息传递名单；接收页以同源请求把结果送回提取窗口。脚本不读取、不显示、不保存 Cookie。脚本完成后切回本站，结果会自动出现；连接令牌 10 分钟有效且只能读取一次。
+
+工具支持导出名单专用 JSON（`kind: "following-list"`、`version: 1`、`exportedAt`、`creators`、`platformResults`）和 UTF-8 TXT。TXT 每行是 `主页链接<TAB>博主名称`，可直接粘贴到批量导入框。名单 JSON 可在提取窗口中重新导入并追加；它与“管理数据”中的全站备份格式不同，不能用于替换全站数据。部分分页结果会标记为未完整，导出或追加前需要明确勾选“包含未完整结果”。
+
 抖音同步时会在后台短暂启动无界面的 Edge 或 Chrome，取得主页数据后立即关闭。哔站同步由端口 `8001` 的本机服务处理。一次全量同步会逐批处理；单批或单个博主失败时会保留已有缓存并继续后续批次，可在“关注列表”逐个重试。
 
 ## 项目结构
@@ -161,17 +169,22 @@ https://www.douyin.com/user/...
 app/
   api/health/route.ts       # 本机网站与抓取服务健康检查
   api/feed/sync/route.ts   # 只读同步代理与响应归一化
+  api/following/collect    # 抖音 / 哔站关注名单 NDJSON 提取接口
   api/metadata/route.ts    # 公开页面元数据读取
   creator/[id]/page.tsx    # 博主个人页路由
   following/page.tsx       # 关注列表路由
   globals.css              # 页面样式和响应式布局
 components/VideoHub.tsx    # 三个页面、表单、筛选、备份等交互
+components/FollowingCollector.tsx # 关注名单提取、预览、导入导出
 lib/douyin-browser.ts      # 使用本机浏览器读取抖音主页投稿
+lib/server/following.ts    # 两个平台的关注名单采集器
+lib/following-list.ts      # 名单格式、校验、TXT 与 NDJSON 工具
 lib/feed-context.tsx       # 跨路由共享的客户端数据状态
 lib/feed-logic.ts          # 最近更新过滤和视频排序逻辑
 lib/feed-storage.ts        # 使用 IndexedDB 保存大批量关注与视频数据
 lib/feed-types.ts          # 关注与视频数据结构
 scripts/                   # 本机抓取服务准备、凭据迁移、启动、停止与检查脚本
+  app-supervisor.mjs       # 网站进程崩溃后自动重启
 ```
 
 ## 验证
@@ -197,9 +210,17 @@ npm run verify
 npm run build
 npx next start --hostname 127.0.0.1 --port 3100
 npm run test:e2e
+npm run test:e2e:following -- http://127.0.0.1:3100
 ```
 
-冒烟的浏览器配置和截图保存在 `.local/e2e/`，不会读写正常使用的数据。它不验证平台接口的可用性，真实同步仍需用本机 Cookie 验证。
+主流程冒烟的浏览器配置和截图保存在 `.local/e2e/`；关注名单冒烟使用独立临时浏览器环境，覆盖流式预览、断线后的部分结果确认、追加去重和哔站浏览器连接。两者都不会读写正常使用的数据，平台接口由测试桩替代；真实同步仍需用本机 Cookie 验证。
+
+与本机 FocusExtension 的外链联动可单独用真实 Edge/Chrome 测试。先启动本站，再指定插件目录运行；脚本使用 `.local/e2e/focus-extension-profile/` 中的独立浏览器配置：
+
+```powershell
+$env:FOCUS_EXTENSION_PATH = 'D:\浏览器插件\FocusExtension'
+npm run test:e2e:extension -- http://127.0.0.1:3100
+```
 
 迁移到其他电脑、目录职责和 GitHub CI 说明见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`docs/PROJECT-STRUCTURE.md`](docs/PROJECT-STRUCTURE.md)。
 
