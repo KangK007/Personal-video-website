@@ -1,5 +1,6 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:net";
 import path from "node:path";
 import {
   acquireLaunchLock,
@@ -118,6 +119,20 @@ async function waitFor(check, seconds = 30) {
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
+}
+
+function portIsFree(port) {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.once("error", () => resolve(false));
+    server.listen({ host: "127.0.0.1", port }, () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
+
+async function waitForPortFree(port, seconds = 5) {
+  return waitFor(() => portIsFree(port), seconds);
 }
 
 // A cold uvicorn start is usually a few seconds, but the first launch after a stop
@@ -254,6 +269,13 @@ async function main() {
     runBuild();
   }
   if (!appReady) {
+    // Free the port check: the supervisor would otherwise restart-loop forever when
+    // an unmanaged process (e.g. `npm run dev`) is still starting on the same port.
+    if (!(await waitForPortFree(appPort))) {
+      throw new Error(
+        `端口 ${appPort} 已被其他进程占用（可能是另一个开发服务器）。请先关闭它，或设置 APP_PORT 使用其他端口后重试。`,
+      );
+    }
     console.log("正在启动网站...");
     spawnDetached(
       "app",
