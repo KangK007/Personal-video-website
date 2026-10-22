@@ -22,7 +22,7 @@ vi.mock("@/lib/douyin-browser", () => ({
   resolveBrowserExecutable: mocks.resolveBrowserExecutable,
 }));
 
-import { collectBilibiliFollowing } from "@/lib/bilibili-browser";
+import { collectBilibiliFollowing, interpretBilibiliNav } from "@/lib/bilibili-browser";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -83,5 +83,25 @@ describe("bilibili browser following collector", () => {
     expect(mocks.closePage).toHaveBeenCalledOnce();
     expect(mocks.closeContext).toHaveBeenCalledOnce();
     expect(mocks.closeBrowser).toHaveBeenCalledOnce();
+  });
+});
+
+describe("interpretBilibiliNav", () => {
+  it("recognizes a logged-in account", () => {
+    expect(interpretBilibiliNav({ code: 0, data: { isLogin: true, uname: "测试账号" } }))
+      .toEqual({ status: "logged-in", accountName: "测试账号" });
+  });
+
+  it("treats an authentic not-logged-in answer as an expired cookie", () => {
+    expect(interpretBilibiliNav({ code: -101, data: { isLogin: false } })).toMatchObject({ status: "logged-out" });
+    expect(interpretBilibiliNav({ code: 0, data: { isLogin: false } })).toMatchObject({ status: "logged-out" });
+  });
+
+  it("does not call risk control or unexpected payloads 'logged-out'", () => {
+    // These say nothing about the cookie; blocking the platform would be wrong.
+    expect(interpretBilibiliNav({ code: -352, message: "风控校验失败" })).toMatchObject({ status: "unavailable" });
+    expect(interpretBilibiliNav({ code: -412 })).toMatchObject({ status: "unavailable" });
+    expect(interpretBilibiliNav({ code: 0 })).toMatchObject({ status: "unavailable" });
+    expect(interpretBilibiliNav({})).toMatchObject({ status: "unavailable" });
   });
 });

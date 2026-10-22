@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -11,15 +14,20 @@ vi.mock("@/lib/bilibili-browser", () => ({
 
 type RouteModule = typeof import("@/app/api/bilibili/session/route");
 let POST: RouteModule["POST"];
+let tempDir = "";
 
 beforeEach(async () => {
   vi.resetModules();
   mocks.checkBilibiliLogin.mockReset();
+  tempDir = mkdtempSync(path.join(os.tmpdir(), "bili-session-"));
+  vi.stubEnv("BILIBILI_COOKIE_FILE", path.join(tempDir, "cookie.txt"));
   ({ POST } = await import("@/app/api/bilibili/session/route"));
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  if (tempDir) rmSync(tempDir, { recursive: true, force: true });
 });
 
 function sessionRequest(origin = "http://127.0.0.1:3000") {
@@ -27,6 +35,10 @@ function sessionRequest(origin = "http://127.0.0.1:3000") {
     method: "POST",
     headers: { host: "127.0.0.1:3000", origin },
   });
+}
+
+function writeCookie(value: string) {
+  writeFileSync(path.join(tempDir, "cookie.txt"), value);
 }
 
 describe("bilibili session route", () => {
@@ -69,5 +81,35 @@ describe("bilibili session route", () => {
 
     expect(response.status).toBe(403);
     expect(mocks.checkBilibiliLogin).not.toHaveBeenCalled();
+  });
+
+  it("re-probes when the cookie file changes so an updated Cookie is not blocked by the cache", async () => {
+    mocks.checkBilibiliLogin
+      .mockResolvedValueOnce({ status: "logged-out" })
+      .mockResolvedValueOnce({ status: "logged-in" });
+    writeCookie("SESSDATA=old");
+    await POST(sessionRequest());
+    writeCookie("SESSDATA=new-and-longer");
+
+    const second = await POST(sessionRequest());
+
+    expect(mocks.checkBilibiliLogin).toHaveBeenCalledTimes(2);
+    await expect(second.json()).resolves.toMatchObject({ status: "logged-in" });
+  });
+
+  it("does not cache the answer of a cancelled probe", async () => {
+    mocks.checkBilibiliLogin.mockResolvedValue({ status: "logged-in" });
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = new Request("http://127.0.0.1:3000/api/bilibili/session", {
+      method: "POST",
+      headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000" },
+      signal: controller.signal,
+    });
+
+    await expect((await POST(cancelled)).json()).resolves.toMatchObject({ status: "unavailable" });
+    await POST(sessionRequest());
+
+    expect(mocks.checkBilibiliLogin).toHaveBeenCalledTimes(2);
   });
 });

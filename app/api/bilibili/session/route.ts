@@ -1,3 +1,5 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { NextResponse } from "next/server";
 import { checkBilibiliLogin, type BilibiliSessionState } from "@/lib/bilibili-browser";
 import { assertLocalRequest, LocalApiRequestError } from "@/lib/local-api-request";
@@ -11,7 +13,30 @@ const CACHE_TTL_MS: Record<BilibiliSessionState["status"], number> = {
   unavailable: 30_000,
 };
 
-let cached: { state: BilibiliSessionState; at: number } | null = null;
+type CacheEntry = { state: BilibiliSessionState; at: number; fingerprint: string };
+
+let cached: CacheEntry | null = null;
+
+function cookieFilePath() {
+  const configured = process.env.BILIBILI_COOKIE_FILE?.trim() || ".local/bilibili-cookie.txt";
+  return path.isAbsolute(configured)
+    ? configured
+    : path.join(/* turbopackIgnore: true */ process.cwd(), configured);
+}
+
+/**
+ * Identifies the credential the sidecar *would* load. The sidecar reads its cookie
+ * once at startup, so a changed file means this cache must be re-probed (and the
+ * remediation message tells the user to restart the site so the sidecar reloads it).
+ */
+async function cookieFingerprint() {
+  try {
+    const stat = await fs.stat(cookieFilePath());
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return "missing";
+  }
+}
 
 export async function POST(request: Request) {
   try {
@@ -24,7 +49,9 @@ export async function POST(request: Request) {
     );
   }
 
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS[cached.state.status]) {
+  const fingerprint = await cookieFingerprint();
+  if (cached && cached.fingerprint === fingerprint
+    && Date.now() - cached.at < CACHE_TTL_MS[cached.state.status]) {
     return NextResponse.json(cached.state);
   }
 
@@ -34,6 +61,11 @@ export async function POST(request: Request) {
   } catch {
     state = { status: "unavailable", message: "无法检查哔站登录状态" };
   }
-  cached = { state, at: Date.now() };
+
+  // A cancelled probe says nothing about the credential; never cache it.
+  if (request.signal.aborted) {
+    return NextResponse.json({ status: "unavailable", message: "登录状态检查已取消" });
+  }
+  cached = { state, at: Date.now(), fingerprint };
   return NextResponse.json(state);
 }

@@ -68,7 +68,7 @@ async function readCookieHeader() {
 function isRetryable(error: unknown) {
   return error instanceof Error
     && error.name !== "AbortError"
-    && (/超时|网络|连接|暂时不可用|接口返回 5\d\d|429/.test(error.message));
+    && (/超时|网络|连接|暂时不可用|接口返回 5\d\d|限流/.test(error.message));
 }
 
 async function requestJson(page: Page, url: string, signal?: AbortSignal) {
@@ -100,6 +100,9 @@ async function requestJson(page: Page, url: string, signal?: AbortSignal) {
     throw new Error(result.error === "response-too-large" ? "哔站关注接口响应过大" : "哔站关注接口请求超时或网络中断");
   }
   if (result.status === 429) throw new Error("哔站关注接口触发限流，请稍后重试");
+  if (result.status === 412 || result.status === 403) {
+    throw new Error("哔站关注接口触发风控或验证码，请在系统浏览器打开哔站确认账号状态后重试");
+  }
   if (result.status >= 500) throw new Error(`哔站接口返回 ${result.status}`);
   if (result.status < 200 || result.status >= 300 || result.error) throw new Error("哔站关注接口返回了不可识别的数据");
   return asRecord(result.payload);
@@ -136,6 +139,28 @@ export type BilibiliSessionState = {
 };
 
 /**
+ * Classifies the `/x/web-interface/nav` payload. Only an authentic "not logged in"
+ * answer means the cookie is expired; risk control (-352/-412) or an unexpected
+ * shape is a transient probe failure and must not block the whole platform.
+ */
+export function interpretBilibiliNav(nav: Record<string, unknown>): BilibiliSessionState {
+  const code = Number(nav.code);
+  const data = asRecord(nav.data);
+  if (code === 0 && data.isLogin === true) {
+    return { status: "logged-in", ...(data.uname ? { accountName: String(data.uname) } : {}) };
+  }
+  if (code === -101 || (code === 0 && data.isLogin === false)) {
+    return { status: "logged-out", message: "哔站 Cookie 已失效或未登录，请重新更新 Cookie" };
+  }
+  return {
+    status: "unavailable",
+    message: Number.isFinite(code)
+      ? `哔站登录状态检查返回 ${code}（可能触发风控），请稍后重试`
+      : "哔站登录状态检查返回了无法识别的响应，请稍后重试",
+  };
+}
+
+/**
  * Lightweight login probe used before a post sync: the saved Cookie is the only
  * credential the sidecar sends, and an expired one turns into a long series of
  * risk-control failures instead of an actionable message.
@@ -157,11 +182,7 @@ export async function checkBilibiliLogin(signal?: AbortSignal): Promise<Bilibili
     signal?.addEventListener("abort", onAbort, { once: true });
     throwIfAborted(signal);
     const nav = await readNavPayload(page);
-    const navData = asRecord(nav.data);
-    if (Number(nav.code) === 0 && navData.isLogin === true) {
-      return { status: "logged-in", ...(navData.uname ? { accountName: String(navData.uname) } : {}) };
-    }
-    return { status: "logged-out", message: "哔站 Cookie 已失效或未登录，请重新更新 Cookie" };
+    return interpretBilibiliNav(nav);
   } catch (error) {
     if (signal?.aborted) throw createAbortError();
     return {

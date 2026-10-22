@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyBilibiliRunLimit, buildSyncBatches, clearSyncErrors, getBilibiliCooldownMs, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, MAX_BILIBILI_CREATORS_PER_RUN, mergeSyncResponse, RESTRICTION_RETRY_DELAY_MS, type SyncResponse } from "@/lib/feed-sync";
+import { applyBilibiliRunLimit, buildSyncBatches, clearSyncErrors, computeSyncStatus, getBilibiliCooldownMs, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, MAX_BILIBILI_CREATORS_PER_RUN, mergeRestrictionRetry, mergeSyncResponse, RESTRICTION_RETRY_DELAY_MS, type SyncResponse } from "@/lib/feed-sync";
 import { MAX_FEED_NAME_LENGTH, MAX_FEED_TITLE_LENGTH, migrateFeedState } from "@/lib/feed-storage";
 import type { Creator, FeedState, VideoItem } from "@/lib/feed-types";
 
@@ -336,5 +336,70 @@ describe("clearSyncErrors", () => {
     const state = { creators: [{ ...creator, id: "healthy" }], videos: [] };
     expect(clearSyncErrors(state, ["healthy"])).toBe(state);
     expect(clearSyncErrors(state, ["missing"])).toBe(state);
+  });
+});
+
+describe("computeSyncStatus", () => {
+  it("maps the run counters to the top-bar status", () => {
+    expect(computeSyncStatus({ failed: 0, succeeded: 3, skipped: 0, deferred: 0 })).toBe("success");
+    expect(computeSyncStatus({ failed: 1, succeeded: 2, skipped: 0, deferred: 0 })).toBe("partial");
+    expect(computeSyncStatus({ failed: 2, succeeded: 0, skipped: 0, deferred: 0 })).toBe("error");
+    // Restriction/deferred skips mean the run is incomplete, not successful.
+    expect(computeSyncStatus({ failed: 0, succeeded: 2, skipped: 3, deferred: 0 })).toBe("partial");
+    expect(computeSyncStatus({ failed: 0, succeeded: 2, skipped: 0, deferred: 40 })).toBe("partial");
+    // Cookie-blocked runs sync nothing: the bar must not claim success.
+    expect(computeSyncStatus({ failed: 0, succeeded: 0, skipped: 5, deferred: 0 })).toBe("error");
+  });
+});
+
+describe("mergeRestrictionRetry", () => {
+  const successVideo: VideoItem = {
+    id: "video-a",
+    platform: "douyin",
+    videoUrl: "https://www.douyin.com/video/1234567890123456789",
+    creatorId: "a",
+    title: "A 的新视频",
+    source: "feed-sync",
+    createdAt: "2026-10-22T00:00:00.000Z",
+  };
+
+  it("keeps a creator that already succeeded in the first attempt", () => {
+    const first: SyncResponse = {
+      configured: true,
+      videos: [successVideo],
+      results: [
+        { creatorId: "a", status: "success", count: 1, complete: true, mode: "snapshot" },
+        { creatorId: "b", status: "error", failureCode: "douyin_rate_limited", message: "限流" },
+      ],
+    };
+    const retried: SyncResponse = {
+      videos: [],
+      results: [
+        // The retry cannot be trusted to re-report A's success.
+        { creatorId: "a", status: "error", failureCode: "douyin_rate_limited", message: "限流" },
+        { creatorId: "b", status: "error", failureCode: "douyin_rate_limited", message: "限流" },
+      ],
+    };
+
+    const merged = mergeRestrictionRetry(first, retried);
+
+    expect(merged.results?.find((result) => result.creatorId === "a")).toMatchObject({ status: "success", count: 1 });
+    expect(merged.videos).toEqual([successVideo]);
+  });
+
+  it("takes the retry result for creators that failed the first attempt", () => {
+    const first: SyncResponse = {
+      videos: [],
+      results: [{ creatorId: "b", status: "error", failureCode: "douyin_rate_limited", message: "限流" }],
+    };
+    const retried: SyncResponse = {
+      videos: [{ ...successVideo, id: "video-b", creatorId: "b" }],
+      results: [{ creatorId: "b", status: "success", count: 1, complete: true, mode: "snapshot" }],
+    };
+
+    const merged = mergeRestrictionRetry(first, retried);
+
+    expect(merged.results?.[0]).toMatchObject({ creatorId: "b", status: "success" });
+    expect(merged.videos).toEqual([{ ...successVideo, id: "video-b", creatorId: "b" }]);
   });
 });

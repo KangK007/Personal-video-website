@@ -72,6 +72,13 @@ const context = await chromium.launchPersistentContext(PROFILE_DIR, {
 });
 
 const page = context.pages()[0] ?? (await context.newPage());
+// The extension smoke must stay hermetic: the session preflight and the sync route
+// are both stubbed so a reload never launches a browser or reads the real cookie.
+await context.route("**/api/bilibili/session", (route) => route.fulfill({
+  status: 200,
+  contentType: "application/json",
+  body: JSON.stringify({ status: "logged-in" }),
+}));
 await context.route("**/api/feed/sync", async (route) => {
   const creators = JSON.parse(route.request().postData() ?? "{}").creators ?? [];
   await route.fulfill({

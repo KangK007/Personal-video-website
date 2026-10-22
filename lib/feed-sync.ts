@@ -198,6 +198,54 @@ export function clearSyncErrors(state: SyncStateSnapshot, ids: Iterable<string>)
   };
 }
 
+/**
+ * Summarizes the outcome of one sync run. "partial" means something was synced but
+ * not everything; when nothing was synced the top bar must not claim success.
+ */
+export function computeSyncStatus(input: {
+  failed: number;
+  succeeded: number;
+  skipped: number;
+  deferred: number;
+}): SyncStatus {
+  const { failed, succeeded, skipped, deferred } = input;
+  if (failed > 0) return succeeded > 0 ? "partial" : "error";
+  if (succeeded > 0) return skipped > 0 || deferred > 0 ? "partial" : "success";
+  return skipped > 0 || deferred > 0 ? "error" : "success";
+}
+
+/**
+ * Merges the retry of a rate-limited batch into its first answer. Creators that
+ * already succeeded must keep their first result (and videos); only the rest is
+ * taken from the retry, mirroring the provider-unavailable retry in
+ * requestSyncBatch.
+ */
+export function mergeRestrictionRetry(original: SyncResponse, retried: SyncResponse): SyncResponse {
+  const originalResults = original.results ?? [];
+  const retriedResults = retried.results ?? [];
+  const kept = new Set(originalResults.flatMap((result) => (
+    result.status === "success" && typeof result.creatorId === "string" ? [result.creatorId] : []
+  )));
+  const retriedMap = new Map(retriedResults.map((result) => [result.creatorId, result]));
+  const mergedResults = originalResults.map((result) => (
+    kept.has(result.creatorId ?? "") ? result : retriedMap.get(result.creatorId ?? "") ?? result
+  ));
+  const knownIds = new Set(mergedResults.map((result) => result.creatorId));
+  for (const result of retriedResults) {
+    if (!knownIds.has(result.creatorId)) mergedResults.push(result);
+  }
+  return {
+    ...original,
+    configured: original.configured ?? retried.configured,
+    syncedAt: original.syncedAt ?? retried.syncedAt,
+    videos: [
+      ...(original.videos ?? []).filter((video) => kept.has(video.creatorId ?? "")),
+      ...(retried.videos ?? []).filter((video) => !kept.has(video.creatorId ?? "")),
+    ],
+    results: mergedResults,
+  };
+}
+
 export function collectKnownDouyinVideoIds(videos: VideoItem[], creatorId: string) {
   const ids = new Set<string>();
   for (const video of sortVideos(videos.filter((item) => (
