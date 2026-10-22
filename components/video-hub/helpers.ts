@@ -12,7 +12,8 @@ export type CreatorDraft = {
   platform: Platform;
   profileUrl: string;
   name: string;
-  nameSource: "manual" | "fallback";
+  nameSource: "manual" | "fallback" | "platform";
+  avatarUrl?: string;
 };
 
 export const MAX_CREATOR_IMPORT_LINES = MAX_FEED_CREATORS;

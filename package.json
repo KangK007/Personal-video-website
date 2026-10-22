@@ -20,6 +20,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "node ./scripts/e2e-smoke.mjs",
+    "test:e2e:following": "node ./scripts/following-e2e-smoke.mjs",
+    "test:e2e:extension": "node ./scripts/extension-link-smoke.mjs",
     "verify": "npm run typecheck && npm run lint && npm test && npm run build"
   },
   "dependencies": {

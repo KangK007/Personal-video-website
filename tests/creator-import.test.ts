@@ -75,6 +75,30 @@ describe("parseCreatorLines", () => {
     expect(result.next).toBe(current);
   });
 
+  it("重复导入时保留已有博主的昵称来源和暂停状态", () => {
+    const existing: Creator = {
+      id: "creator-1",
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "平台原昵称",
+      nameSource: "platform",
+      enabled: false,
+      lastSyncAt: "2026-10-20T00:00:00.000Z",
+      syncError: "上次同步失败",
+    };
+    const current = [existing];
+    const result = appendUniqueCreators(current, [{
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "导入的新昵称",
+      nameSource: "manual",
+    }], () => "creator-2");
+
+    expect(result.added).toBe(0);
+    expect(result.next).toBe(current);
+    expect(result.next[0]).toEqual(existing);
+  });
+
   it("在当前列表中原子去重视频追加", () => {
     const current: VideoItem[] = [{
       id: "video-1",

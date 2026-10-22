@@ -9,6 +9,14 @@ import {
   type Page,
   type Response,
 } from "playwright-core";
+import {
+  cleanFollowingName,
+  followingAvatar,
+  followingProfileUrl,
+  FOLLOWING_LIMIT,
+  validFollowingId,
+  type FollowingCreator,
+} from "@/lib/following-list";
 
 const PAGE_TIMEOUT_MS = 30_000;
 const MAX_COOKIE_BYTES = 64 * 1024;
@@ -213,7 +221,7 @@ async function waitForNextPostResponse(page: Page, signal?: AbortSignal) {
   throw lastError;
 }
 
-async function resolveBrowserExecutable() {
+export async function resolveBrowserExecutable() {
   const configured = process.env.DOUYIN_BROWSER_EXECUTABLE?.trim();
   const candidates = [
     configured,
@@ -231,7 +239,7 @@ async function resolveBrowserExecutable() {
       // Try the next standard browser location.
     }
   }
-  throw new Error("未找到可用于抖音同步的 Microsoft Edge 或 Google Chrome");
+  throw new Error("未找到可用的 Microsoft Edge 或 Google Chrome");
 }
 
 async function readCookieHeader() {
@@ -255,14 +263,16 @@ async function readCookieHeader() {
   return value;
 }
 
-function parseCookies(header: string) {
+function parseCookies(header: string, cookieDomain?: string) {
   return header.split(";").flatMap((part) => {
     const separator = part.indexOf("=");
     if (separator <= 0) return [];
     const name = part.slice(0, separator).trim();
     const value = part.slice(separator + 1).trim();
     if (!name || /[\u0000-\u001f\u007f]/.test(name + value)) return [];
-    return [{ name, value, url: "https://www.douyin.com/" }];
+    return [cookieDomain
+      ? { name, value, domain: cookieDomain, path: "/" }
+      : { name, value, url: "https://www.douyin.com/" }];
   });
 }
 
@@ -285,9 +295,9 @@ function buildUserAgent(browser: Browser, executablePath: string) {
   return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36${edgeSuffix}`;
 }
 
-async function createContext(browser: Browser, executablePath: string, cookieHeader: string) {
-  const cookies = parseCookies(cookieHeader);
-  if (cookies.length === 0) throw new Error("抖音 Cookie 文件中没有可用字段");
+export async function createContext(browser: Browser, executablePath: string, cookieHeader: string, cookieDomain?: string) {
+  const cookies = parseCookies(cookieHeader, cookieDomain);
+  if (cookies.length === 0) throw new Error("Cookie 文件中没有可用字段");
   const context = await browser.newContext({
     userAgent: buildUserAgent(browser, executablePath),
     viewport: getViewport(cookies),
@@ -473,5 +483,141 @@ export async function openDouyinBrowserSession(signal?: AbortSignal): Promise<Do
   } catch (error) {
     await browser.close();
     throw error;
+  }
+}
+
+export type DouyinFollowingPage = {
+  creators: FollowingCreator[];
+  received: number;
+  total: number;
+  invalidCount: number;
+  account?: { id: string; name: string };
+};
+
+/** Read the authenticated user's following pages through the same browser session used for feed sync. */
+export async function collectDouyinFollowing(
+  onPage: (page: DouyinFollowingPage) => Promise<void> | void,
+  signal?: AbortSignal,
+) {
+  throwIfAborted(signal);
+  const [executablePath, cookieHeader] = await Promise.all([resolveBrowserExecutable(), readCookieHeader()]);
+  const browser = await chromium.launch({
+    executablePath,
+    headless: true,
+    args: ["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
+  });
+  const context = await createContext(browser, executablePath, cookieHeader);
+  const page = await context.newPage();
+  const onAbort = () => { void page.close().catch(() => undefined); };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    throwIfAborted(signal);
+    const selfResponsePromise = page.waitForResponse((response) => {
+      try { return new URL(response.url()).pathname === "/aweme/v1/web/user/profile/self/"; } catch { return false; }
+    }, { timeout: PAGE_TIMEOUT_MS });
+    selfResponsePromise.catch(() => undefined);
+    await page.goto("https://www.douyin.com/user/self", { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS });
+    const self = asRecord(await (await selfResponsePromise).json());
+    const selfUser = asRecord(self.user);
+    if (Number(self.status_code) !== 0 || !validFollowingId("douyin", String(selfUser.sec_uid ?? ""))) {
+      throw new Error("抖音登录状态无效，请更新 Cookie 后重试");
+    }
+    await onPage({
+      creators: [], received: 0, total: Number(selfUser.following_count) || 0, invalidCount: 0,
+      account: { id: String(selfUser.sec_uid), name: cleanFollowingName(selfUser.nickname, "douyin") },
+    });
+
+    const seenIds = new Set<string>();
+    const seenPages = new Set<string>();
+    let expectedTotal: number | undefined;
+    let received = 0;
+    let invalidCount = 0;
+    let lastOffset = -1;
+    let requestedResponse: Promise<Response> | null = null;
+
+    const getFollowingResponse = async (response: Response) => {
+      const payload = asRecord(await response.json());
+      if (Number(payload.status_code) !== 0 || !Array.isArray(payload.followings)) {
+        throw new Error("抖音关注接口返回了不可识别的数据，可能需要重新登录或完成验证");
+      }
+      const items = payload.followings as unknown[];
+      const total = Number(payload.total);
+      const offset = Number(payload.offset);
+      if (!Number.isSafeInteger(total) || total < 0 || total > FOLLOWING_LIMIT) throw new Error("抖音关注总数异常，未完整提取");
+      if (!Number.isSafeInteger(offset) || offset <= lastOffset) throw new Error("抖音关注分页游标重复或倒退，未完整提取");
+      lastOffset = offset;
+      if (expectedTotal !== undefined && expectedTotal !== total) throw new Error("抖音关注总数在提取过程中发生变化");
+      expectedTotal = total;
+      const signature = items.map((item) => String(asRecord(item).sec_uid ?? asRecord(item).uid ?? "")).join("|");
+      if (seenPages.has(signature)) throw new Error("抖音关注分页重复，未能确认已读取全部名单");
+      seenPages.add(signature);
+      const creators: FollowingCreator[] = [];
+      for (const value of items) {
+        const item = asRecord(value);
+        const id = String(item.sec_uid ?? "");
+        if (!validFollowingId("douyin", id)) { invalidCount += 1; continue; }
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        creators.push({
+          platform: "douyin", platformUserId: id,
+          name: cleanFollowingName(item.nickname, "douyin"),
+          profileUrl: followingProfileUrl("douyin", id),
+          ...(followingAvatar(item.avatar_thumb ?? item.avatar_medium ?? item.avatar_larger) ? { avatarUrl: followingAvatar(item.avatar_thumb ?? item.avatar_medium ?? item.avatar_larger) } : {}),
+        });
+      }
+      received = seenIds.size;
+      await onPage({ creators, received, total, invalidCount });
+      return { hasMore: payload.has_more === true || Number(payload.has_more) === 1, itemCount: items.length };
+    };
+
+    const followingPath = "/aweme/v1/web/user/following/list/";
+    const waitFollowingResponse = (expectedOffset: number) => page.waitForResponse((response) => {
+      try {
+        const url = new URL(response.url());
+        const offset = Number(url.searchParams.get("offset"));
+        // The request uses the previous response's body offset as its query offset.
+        // Match it exactly so a fast scroll cannot skip an intermediate page.
+        return url.pathname === followingPath && Number.isSafeInteger(offset) && offset === expectedOffset;
+      } catch { return false; }
+    }, { timeout: PAGE_TIMEOUT_MS });
+    requestedResponse = waitFollowingResponse(0);
+    requestedResponse.catch(() => undefined);
+    // The outer summary card only expands on the text control; clicking the card
+    // itself can leave the page unchanged in current Douyin builds.
+    const followButton = page.locator('[data-e2e="user-info-follow"]').getByText("关注", { exact: true });
+    if (await followButton.count() !== 1) throw new Error("抖音关注列表入口未找到，页面结构可能已变化");
+    await followButton.click();
+    let next = await getFollowingResponse(await requestedResponse);
+    let pages = 1;
+    while (next.hasMore) {
+      throwIfAborted(signal);
+      if (pages >= 1000 || received >= FOLLOWING_LIMIT) throw new Error("抖音关注列表超过安全上限，未完整提取");
+      requestedResponse = waitFollowingResponse(lastOffset);
+      requestedResponse.catch(() => undefined);
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(resolve, 1500);
+        if (!signal) return;
+        const abort = () => { clearTimeout(timeout); reject(createAbortError()); };
+        signal.addEventListener("abort", abort, { once: true });
+      });
+      const scrollableCount = await page.evaluate(() => {
+        const elements = [...document.querySelectorAll<HTMLElement>("div")]
+          .filter((element) => element.clientHeight > 80
+            && element.scrollHeight > element.clientHeight + 40
+            && ["auto", "scroll"].includes(getComputedStyle(element).overflowY));
+        elements.forEach((element) => { element.scrollTop = element.scrollHeight; });
+        return elements.length;
+      });
+      if (!scrollableCount) throw new Error("抖音关注列表滚动容器未找到，未完整提取");
+      next = await getFollowingResponse(await requestedResponse);
+      pages += 1;
+      if (next.itemCount === 0 && next.hasMore) throw new Error("抖音关注分页提前返回空页，未完整提取");
+    }
+    if (expectedTotal !== undefined && received !== expectedTotal) throw new Error("抖音关注数量与平台总数不一致，未完整提取");
+    return { received, total: expectedTotal ?? received, invalidCount };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    await context.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
   }
 }

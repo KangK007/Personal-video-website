@@ -41,7 +41,7 @@ function effectivePort(url: URL) {
   return url.protocol === "https:" ? "443" : "80";
 }
 
-function assertLocalJsonRequest(request: Request) {
+export function assertLocalRequest(request: Request) {
   let requestUrl: URL;
   try {
     requestUrl = new URL(request.url);
@@ -87,15 +87,6 @@ function assertLocalJsonRequest(request: Request) {
     throw new LocalApiRequestError("仅允许同源请求", 403);
   }
 
-  const mediaType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-  if (mediaType !== JSON_MEDIA_TYPE) {
-    throw new LocalApiRequestError("请求必须使用 application/json", 415);
-  }
-
-  const contentEncoding = request.headers.get("content-encoding")?.trim().toLowerCase();
-  if (contentEncoding && contentEncoding !== "identity") {
-    throw new LocalApiRequestError("不支持压缩的请求正文", 415);
-  }
 }
 
 async function readLimitedText(request: Request, maxBytes: number) {
@@ -140,7 +131,15 @@ async function readLimitedText(request: Request, maxBytes: number) {
 }
 
 export async function readLocalJsonRequest(request: Request, maxBytes: number): Promise<unknown> {
-  assertLocalJsonRequest(request);
+  assertLocalRequest(request);
+  const mediaType = request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  if (mediaType !== JSON_MEDIA_TYPE) {
+    throw new LocalApiRequestError("请求必须使用 application/json", 415);
+  }
+  const contentEncoding = request.headers.get("content-encoding")?.trim().toLowerCase();
+  if (contentEncoding && contentEncoding !== "identity") {
+    throw new LocalApiRequestError("不支持压缩的请求正文", 415);
+  }
   const text = await readLimitedText(request, maxBytes);
   try {
     return JSON.parse(text) as unknown;

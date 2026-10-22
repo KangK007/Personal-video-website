@@ -16,6 +16,7 @@ const sidecarRoot = path.join(localRoot, "Douyin_TikTok_Download_API");
 const sidecarPython = path.join(sidecarRoot, ".venv", "Scripts", "python.exe");
 const sidecarEntry = path.join(projectRoot, "scripts", "sidecar-entry.py");
 const sidecarSupervisor = path.join(projectRoot, "scripts", "sidecar-supervisor.mjs");
+const appSupervisor = path.join(projectRoot, "scripts", "app-supervisor.mjs");
 const appMarker = path.join(projectRoot, "node_modules", "next", "dist", "bin", "next");
 const settings = JSON.parse(readFileSync(path.join(projectRoot, "scripts", "local-settings.json"), "utf8"));
 const forceBuild = process.argv.includes("--build");
@@ -224,17 +225,28 @@ async function main() {
 
   let appReady = await appIsReady(`${appUrl}/api/health`);
   const needsBuild = forceBuild || buildIsStale();
-  const appPid = readManagedPid("app", appMarker);
+  const appPid = readManagedPid("app", appSupervisor);
+  const appWorkerPid = readManagedPid("app-worker", appMarker);
+  if (appReady && !appPid && appWorkerPid) {
+    console.log("检测到网站监督器已退出，正在重新接管网站进程...");
+    await stopManagedProcess("app-worker", appMarker);
+    await waitFor(async () => !(await appIsReady(`${appUrl}/api/health`)), 5);
+    appReady = false;
+  }
   if (appReady && needsBuild) {
     if (!appPid) {
       throw new Error("检测到需要重建，但当前网站不是由本启动器管理。请先关闭现有网站进程再重试。");
     }
     console.log("正在停止旧网站并重新构建...");
-    await stopManagedProcess("app", appMarker);
+    await stopManagedProcess("app", appSupervisor);
+    await stopManagedProcess("app-worker", appMarker);
     await waitFor(async () => !(await appIsReady(`${appUrl}/api/health`)), 5);
     appReady = false;
   } else if (!appReady && appPid) {
-    await stopManagedProcess("app", appMarker);
+    await stopManagedProcess("app", appSupervisor);
+    await stopManagedProcess("app-worker", appMarker);
+  } else if (!appReady && appWorkerPid) {
+    await stopManagedProcess("app-worker", appMarker);
   }
 
   if (!appReady && needsBuild) {
@@ -246,14 +258,15 @@ async function main() {
     spawnDetached(
       "app",
       process.execPath,
-      [appMarker, "start", "--hostname", "127.0.0.1", "--port", String(appPort)],
+      [appSupervisor, appMarker, "start", "--hostname", "127.0.0.1", "--port", String(appPort)],
       projectRoot,
       appLog,
       appErrorLog,
       { ...process.env, APP_PORT: String(appPort), SIDECAR_PORT: String(sidecarPort), FEED_SIDECAR_URL: sidecarUrl, FEED_SIDECAR_TOKEN: sidecarToken },
     );
     if (!(await waitFor(() => appIsReady(`${appUrl}/api/health`)))) {
-      if (readManagedPid("app", appMarker)) await stopManagedProcess("app", appMarker);
+      if (readManagedPid("app", appSupervisor)) await stopManagedProcess("app", appSupervisor);
+      await stopManagedProcess("app-worker", appMarker);
       throw new Error(`网站启动失败。\n${logTail(appErrorLog)}\n${logTail(appLog)}`);
     }
   }
