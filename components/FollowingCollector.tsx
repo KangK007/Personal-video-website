@@ -66,6 +66,9 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
   progressRef.current = progress;
 
   useEffect(() => () => {
+    // Closing the dialog must stop an in-flight extraction (and the temporary
+    // browser it drives) instead of letting it keep running in the background.
+    controllerRef.current?.abort();
     if (bridgeTimerRef.current) clearInterval(bridgeTimerRef.current);
   }, []);
 
