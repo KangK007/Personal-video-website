@@ -217,6 +217,29 @@ describe("syncBilibiliCreator", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("paces pagination requests instead of firing them back to back", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(videoPage([
+        { bvid: "BV1aaaDEF12", title: "第一页" },
+      ], { pn: 1, ps: 1, count: 2 })))
+      .mockResolvedValueOnce(jsonResponse(videoPage([
+        { bvid: "BV1bbbDEF12", title: "第二页" },
+      ], { pn: 2, ps: 1, count: 2 })))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, data: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = syncBilibiliCreator("http://127.0.0.1:8001", creator, syncedAt);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(400);
+    await expect(pending).resolves.toMatchObject({
+      videos: [{ title: "第一页" }, { title: "第二页" }],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("preserves the HTTP status after a detailed transient response exhausts retries", async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn()

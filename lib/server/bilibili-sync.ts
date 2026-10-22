@@ -27,6 +27,8 @@ const RETRY_DELAY_MS = 700;
 const SIDECAR_HEALTH_TIMEOUT_MS = 2_000;
 const MAX_BILIBILI_PAGES = 1_000;
 const MAX_BILIBILI_VIDEOS = 150_000;
+/** Delay between pagination requests for one creator to avoid burst risk control. */
+const PAGE_DELAY_MS = 1_200;
 
 function isRetryableSidecarStatus(status: number) {
   return status === 408 || (status >= 500 && status <= 599);
@@ -384,6 +386,8 @@ async function getAllBilibiliVideos(
       break;
     }
     requestedPage = pageNumber + 1;
+    // Page requests are the burst risk control reacts to; pace them like a human.
+    await waitWithSignal(PAGE_DELAY_MS, signal);
   }
 
   return Array.from(videos.values());

@@ -25,6 +25,8 @@ export type SyncProgress = {
   succeeded: number;
   failed: number;
   skipped: number;
+  /** Creators intentionally left for a later run by the per-run platform limit. */
+  deferred: number;
   restrictedPlatforms: Platform[];
   currentStart: number;
   currentEnd: number;
@@ -70,9 +72,14 @@ export const MAX_CONSECUTIVE_PROVIDER_FAILURES = 3;
 export const MAX_KNOWN_DOUYIN_VIDEO_IDS = 100;
 export const SYNC_REQUEST_TIMEOUT_MS = 20 * 60 * 1000;
 export const SYNC_RETRY_DELAY_MS = 1_200;
+/** How long to wait before retrying a batch after a platform rate-limit answer. */
+export const RESTRICTION_RETRY_DELAY_MS = 20_000;
+/** Bilibili is paced much slower, so one run only covers a slice of the list. */
+export const MAX_BILIBILI_CREATORS_PER_RUN = 50;
 const DOUYIN_COOLDOWN_MIN_MS = 8_000;
 const DOUYIN_COOLDOWN_RANGE_MS = 6_000;
-const BILIBILI_COOLDOWN_MS = 1_500;
+const BILIBILI_COOLDOWN_MIN_MS = 3_000;
+const BILIBILI_COOLDOWN_RANGE_MS = 2_000;
 const DOUYIN_RESTRICTION_CODES = new Set([
   "douyin_empty_response",
   "douyin_invalid_response",
@@ -104,8 +111,48 @@ export function getDouyinCooldownMs(random = Math.random) {
   return DOUYIN_COOLDOWN_MIN_MS + Math.floor(random() * (DOUYIN_COOLDOWN_RANGE_MS + 1));
 }
 
-export function getBilibiliCooldownMs() {
-  return BILIBILI_COOLDOWN_MS;
+export function getBilibiliCooldownMs(random = Math.random) {
+  return BILIBILI_COOLDOWN_MIN_MS + Math.floor(random() * (BILIBILI_COOLDOWN_RANGE_MS + 1));
+}
+
+/**
+ * Orders Bilibili creators so a limited run makes progress: failures first, then
+ * never-synced records, then the oldest successful syncs.
+ */
+export function prioritizeBilibiliCreators(creators: Creator[]) {
+  const priority = (creator: Creator) => (creator.syncError ? 0 : creator.lastSyncAt ? 2 : 1);
+  const syncedAt = (creator: Creator) => {
+    const value = creator.lastSyncAt ? Date.parse(creator.lastSyncAt) : Number.NaN;
+    return Number.isNaN(value) ? 0 : value;
+  };
+  return [...creators].sort((a, b) => {
+    const diff = priority(a) - priority(b);
+    if (diff !== 0) return diff;
+    return syncedAt(a) - syncedAt(b);
+  });
+}
+
+/**
+ * Caps how many Bilibili creators one run requests, leaving the rest untouched for
+ * later runs. Non-Bilibili creators keep their original position.
+ */
+export function applyBilibiliRunLimit(targets: Creator[]): { planned: Creator[]; deferred: Creator[] } {
+  const bilibili = targets.filter((creator) => creator.platform === "bilibili");
+  if (bilibili.length <= MAX_BILIBILI_CREATORS_PER_RUN) {
+    return { planned: targets, deferred: [] };
+  }
+  const keep = new Set(
+    prioritizeBilibiliCreators(bilibili)
+      .slice(0, MAX_BILIBILI_CREATORS_PER_RUN)
+      .map((creator) => creator.id),
+  );
+  const planned: Creator[] = [];
+  const deferred: Creator[] = [];
+  for (const creator of targets) {
+    if (creator.platform !== "bilibili" || keep.has(creator.id)) planned.push(creator);
+    else deferred.push(creator);
+  }
+  return { planned, deferred };
 }
 
 export function isDouyinRestrictionFailure(result: NonNullable<SyncResponse["results"]>[number]) {

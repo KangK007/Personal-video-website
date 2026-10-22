@@ -117,6 +117,64 @@ async function requestJsonWithRetry(page: Page, url: string, signal?: AbortSigna
   throw new Error("哔站接口请求失败");
 }
 
+async function readNavPayload(page: Page) {
+  const navResponse = page.waitForResponse((response) => {
+    try {
+      const url = new URL(response.url());
+      return url.hostname === "api.bilibili.com" && url.pathname === "/x/web-interface/nav";
+    } catch { return false; }
+  }, { timeout: PAGE_TIMEOUT_MS });
+  navResponse.catch(() => undefined);
+  await page.goto("https://www.bilibili.com/", { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS });
+  return asRecord(await (await navResponse).json());
+}
+
+export type BilibiliSessionState = {
+  status: "logged-in" | "logged-out" | "unavailable";
+  accountName?: string;
+  message?: string;
+};
+
+/**
+ * Lightweight login probe used before a post sync: the saved Cookie is the only
+ * credential the sidecar sends, and an expired one turns into a long series of
+ * risk-control failures instead of an actionable message.
+ */
+export async function checkBilibiliLogin(signal?: AbortSignal): Promise<BilibiliSessionState> {
+  throwIfAborted(signal);
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  let page: Page | undefined;
+  const onAbort = () => { void page?.close().catch(() => undefined); };
+  try {
+    const [executablePath, cookieHeader] = await Promise.all([resolveBrowserExecutable(), readCookieHeader()]);
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: ["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
+    });
+    const context = await createContext(browser, executablePath, cookieHeader, ".bilibili.com");
+    page = await context.newPage();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    throwIfAborted(signal);
+    const nav = await readNavPayload(page);
+    const navData = asRecord(nav.data);
+    if (Number(nav.code) === 0 && navData.isLogin === true) {
+      return { status: "logged-in", ...(navData.uname ? { accountName: String(navData.uname) } : {}) };
+    }
+    return { status: "logged-out", message: "哔站 Cookie 已失效或未登录，请重新更新 Cookie" };
+  } catch (error) {
+    if (signal?.aborted) throw createAbortError();
+    return {
+      status: "unavailable",
+      message: error instanceof Error ? error.message : "无法检查哔站登录状态",
+    };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    await page?.close().catch(() => undefined);
+    await browser?.close().catch(() => undefined);
+  }
+}
+
 export async function collectBilibiliFollowing(
   onPage: (page: BilibiliFollowingPage) => Promise<void> | void,
   signal?: AbortSignal,
@@ -136,15 +194,7 @@ export async function collectBilibiliFollowing(
     page = await context.newPage();
     signal?.addEventListener("abort", onAbort, { once: true });
     throwIfAborted(signal);
-    const navResponse = page.waitForResponse((response) => {
-      try {
-        const url = new URL(response.url());
-        return url.hostname === "api.bilibili.com" && url.pathname === "/x/web-interface/nav";
-      } catch { return false; }
-    }, { timeout: PAGE_TIMEOUT_MS });
-    navResponse.catch(() => undefined);
-    await page.goto("https://www.bilibili.com/", { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS });
-    const nav = asRecord(await (await navResponse).json());
+    const nav = await readNavPayload(page);
     const navData = asRecord(nav.data);
     if (Number(nav.code) !== 0 || navData.isLogin !== true) {
       throw new Error("哔站登录状态无效，请更新 Cookie 后重试");

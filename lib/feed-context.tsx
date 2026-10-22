@@ -19,6 +19,7 @@ import {
   writeFeedState,
 } from "@/lib/feed-storage";
 import {
+  applyBilibiliRunLimit,
   markBatchFailed,
   mergeSyncResponse,
   buildSyncBatches,
@@ -27,8 +28,10 @@ import {
   getDouyinCooldownMs,
   getRestrictedSyncPlatform,
   isProviderUnavailableFailure,
+  MAX_BILIBILI_CREATORS_PER_RUN,
   MAX_CONSECUTIVE_PROVIDER_FAILURES,
   requestSyncBatch,
+  RESTRICTION_RETRY_DELAY_MS,
   syncRequestError,
   waitWithSignal,
   type SyncProgress,
@@ -76,6 +79,7 @@ const EMPTY_PROGRESS: SyncProgress = {
   succeeded: 0,
   failed: 0,
   skipped: 0,
+  deferred: 0,
   restrictedPlatforms: [],
   currentStart: 0,
   currentEnd: 0,
@@ -84,6 +88,26 @@ const EMPTY_PROGRESS: SyncProgress = {
   skippedCreatorIds: [],
   runId: 0,
 };
+
+type BilibiliSessionProbe = {
+  status: "logged-in" | "logged-out" | "unavailable";
+  accountName?: string;
+  message?: string;
+};
+
+/**
+ * Best-effort login probe. A failure to run the probe must not block syncing, so
+ * only an explicit "logged-out" answer changes the run.
+ */
+async function probeBilibiliSession(signal: AbortSignal): Promise<BilibiliSessionProbe | null> {
+  try {
+    const response = await fetch("/api/bilibili/session", { method: "POST", signal });
+    if (!response.ok) return null;
+    return await response.json() as BilibiliSessionProbe;
+  } catch {
+    return null;
+  }
+}
 
 function readLegacyState(): { state: FeedState | null; recoveryMessage?: string } {
   try {
@@ -416,11 +440,17 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       const controller = new AbortController();
       abortRef.current = controller;
       failedIdsRef.current = [];
+      // Bilibili is paced slowly, so one run covers a slice of its list; the rest is
+      // reported as deferred and picked up by the next run.
+      const { planned, deferred } = applyBilibiliRunLimit(targets);
+      const deferredCount = deferred.length;
       let processed = 0;
       let succeeded = 0;
       let failed = 0;
       let skipped = 0;
       let incomingCount = 0;
+      const blockedPlatforms = new Set<Creator["platform"]>();
+      const restrictionRetried = new Set<Creator["platform"]>();
       const skippedCreatorIds: string[] = [];
       const restrictedPlatforms = new Set<Creator["platform"]>();
       let interrupted = false;
@@ -445,21 +475,48 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           ...current,
           ...patch,
           status: patch.status ?? "loading",
-          total: targets.length,
+          total: planned.length,
           processed,
           succeeded,
           failed,
           skipped,
+          deferred: deferredCount,
           runId,
         }));
       };
 
-      publish({ status: "loading", message: `准备同步 ${targets.length} 位博主`, failedCreatorIds: [], skippedCreatorIds: [] });
+      publish({ status: "loading", message: `准备同步 ${planned.length} 位博主`, failedCreatorIds: [], skippedCreatorIds: [] });
 
       try {
-        const batches = buildSyncBatches(targets);
+        // The sidecar only has the saved cookie; warn before it degrades into a long
+        // series of risk-control failures.
+        if (planned.some((creator) => creator.platform === "bilibili")) {
+          publish({ status: "loading", message: "正在检查哔站登录状态" });
+          const session = await probeBilibiliSession(controller.signal);
+          if (controller.signal.aborted) {
+            interrupted = true;
+            publish({ status: "error", message: "同步已取消；已有缓存已保留", currentStart: 0, currentEnd: 0 });
+            return false;
+          }
+          if (session?.status === "logged-out") {
+            blockedPlatforms.add("bilibili");
+            publish({ message: "哔站 Cookie 已失效，本轮跳过哔站博主" });
+          }
+        }
+
+        const batches = buildSyncBatches(planned);
         for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
           const batch = batches[batchIndex];
+          if (blockedPlatforms.has(batch[0].platform)) {
+            // Cookie is known to be invalid: skip without requesting and without
+            // keeping stale risk-control errors on these records.
+            skipped += batch.length;
+            processed += batch.length;
+            skippedCreatorIds.push(...batch.map((creator) => creator.id));
+            clearErrorsFor(batch.map((creator) => creator.id));
+            publish({ message: "哔站 Cookie 已失效，本轮跳过哔站博主", skippedCreatorIds: [...skippedCreatorIds] });
+            continue;
+          }
           if (restrictedPlatforms.has(batch[0].platform)) {
             skipped += batch.length;
             processed += batch.length;
@@ -482,11 +539,28 @@ export function FeedProvider({ children }: { children: ReactNode }) {
 
           let data;
           try {
-            data = await requestSyncBatch(batch, controller.signal, videosRef.current);
-            if (!data.configured && !(Array.isArray(data.results) && data.results.length)) {
-              throw new Error(data.error || "未配置本机同步服务，请先运行 npm run start:local 完成配置");
+            const fetchBatch = async () => {
+              const response = await requestSyncBatch(batch, controller.signal, videosRef.current);
+              if (!response.configured && !(Array.isArray(response.results) && response.results.length)) {
+                throw new Error(response.error || "未配置本机同步服务，请先运行 npm run start:local 完成配置");
+              }
+              if (!Array.isArray(response.results)) throw new Error(response.error || "同步服务返回的数据不完整");
+              return response;
+            };
+            data = await fetchBatch();
+            // A single long-backed-off retry: rate limits are often short-lived, but
+            // retrying immediately makes the platform even more suspicious.
+            const initialRestricted = getRestrictedSyncPlatform(batch, data);
+            if (initialRestricted && !restrictionRetried.has(initialRestricted)) {
+              restrictionRetried.add(initialRestricted);
+              publish({ message: `${initialRestricted === "douyin" ? "抖音" : "哔站"}访问受限，等待 ${Math.round(RESTRICTION_RETRY_DELAY_MS / 1_000)} 秒后重试一次` });
+              await waitWithSignal(RESTRICTION_RETRY_DELAY_MS, controller.signal);
+              if (runIdRef.current !== runId || dataEpochRef.current !== epochAtStart) {
+                interrupted = true;
+                break;
+              }
+              data = await fetchBatch();
             }
-            if (!Array.isArray(data.results)) throw new Error(data.error || "同步服务返回的数据不完整");
           } catch (error) {
             if (controller.signal.aborted) {
               interrupted = true;
@@ -552,7 +626,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           publish({
             message: restrictedPlatform
               ? `${restrictedPlatform === "douyin" ? "抖音" : "哔站"}触发访问限制，已停止该平台后续请求`
-              : `已处理 ${processed}/${targets.length} 位博主，读取 ${incomingCount} 条视频`,
+              : `已处理 ${processed}/${planned.length} 位博主，读取 ${incomingCount} 条视频`,
             restrictedPlatforms: Array.from(restrictedPlatforms),
           });
           if (hasAnotherDouyinBatch && !restrictedPlatform) {
@@ -573,14 +647,26 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           return false;
         }
 
-        const status: SyncStatus = failed === 0 && skipped === 0 ? "success" : succeeded > 0 ? "partial" : "error";
-        const message = skipped > 0
-          ? `已读取 ${incomingCount} 条；平台访问受限，本轮跳过 ${skipped} 位博主，稍后可重试`
-          : failed === 0
-          ? `同步完成，读取 ${incomingCount} 条视频`
-          : `${succeeded ? `已读取 ${incomingCount} 条，` : ""}${failed} 位博主同步失败，可重试`;
+        const bilibiliBlocked = blockedPlatforms.has("bilibili");
+        const status: SyncStatus = failed === 0 && skipped === 0 && deferredCount === 0
+          ? "success"
+          : succeeded > 0 || (failed === 0 && skipped > 0 && !bilibiliBlocked)
+            ? "partial"
+            : "error";
+        const parts: string[] = [];
+        if (incomingCount > 0) parts.push(`读取 ${incomingCount} 条视频`);
+        if (bilibiliBlocked) {
+          parts.push("哔站 Cookie 已失效，本轮未请求哔站博主；请重新运行 setup-sidecar.ps1 更新 Cookie 后重试");
+        } else if (skipped > 0) {
+          parts.push(`平台访问受限，本轮跳过 ${skipped} 位博主，稍后可重试`);
+        }
+        if (deferredCount > 0) {
+          parts.push(`哔站单轮最多同步 ${MAX_BILIBILI_CREATORS_PER_RUN} 位，剩余 ${deferredCount} 位将在下次同步继续`);
+        }
+        if (failed > 0) parts.push(`${failed} 位博主同步失败，可重试`);
+        const message = parts.length ? parts.join("；") : `同步完成，读取 ${incomingCount} 条视频`;
         publish({ status, message, currentStart: 0, currentEnd: 0, failedCreatorIds: failedIdsRef.current, skippedCreatorIds });
-        return failed === 0;
+        return failed === 0 && !bilibiliBlocked;
       } catch (error) {
         const message = syncRequestError(error);
         publish({ status: processed ? "partial" : "error", message, currentStart: 0, currentEnd: 0 });

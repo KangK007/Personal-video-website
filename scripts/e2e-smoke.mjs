@@ -99,7 +99,8 @@ function installSyncStub(context, state) {
       });
       return;
     }
-    if (state.syncMode === "restriction" && creators[0]?.platform === "bilibili") {
+    if (creators[0]?.platform === "bilibili" && (state.syncMode === "restriction" || state.restrictionOnceRemaining > 0)) {
+      if (state.syncMode !== "restriction") state.restrictionOnceRemaining -= 1;
       await route.fulfill({
         status: 429,
         contentType: "application/json",
@@ -209,7 +210,16 @@ function installMetadataStub(context, state) {
   });
 }
 
-const state = { syncCalls: [], syncMode: "ok", metadataCalls: 0, metadataMode: "ok", videoSeed: 0, publishedOffsetMs: 0, syncDelayMs: 0, syncConfigured: true, syncErrorMessage: "" };
+const state = { syncCalls: [], syncMode: "ok", metadataCalls: 0, metadataMode: "ok", videoSeed: 0, publishedOffsetMs: 0, syncDelayMs: 0, syncConfigured: true, syncErrorMessage: "", restrictionOnceRemaining: 0, sessionStatus: "logged-in" };
+
+/** Session probe stub: the sync run must not launch a real browser in tests. */
+function installSessionStub(context, state) {
+  return context.route("**/api/bilibili/session", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ status: state.sessionStatus }),
+  }));
+}
 
 // The first journey must always start from a clean origin. Keeping the profile
 // directory between runs makes IndexedDB data from a failed run contaminate the
@@ -225,6 +235,7 @@ const page = context.pages()[0] ?? (await context.newPage());
 page.on("pageerror", (error) => console.log(`  [pageerror] ${error.message}`));
 installSyncStub(context, state);
 installMetadataStub(context, state);
+installSessionStub(context, state);
 
 const dialogButton = (name) => page.locator(".modal").getByRole("button", { name, exact: false });
 const today = new Date().toISOString().slice(0, 10);
@@ -480,9 +491,22 @@ try {
   check("同步失败保留原有缓存", cardsAfterFailure === 4, `cards=${cardsAfterFailure}`);
   await shot(page, "03-sync-failed");
 
+  // A rate limit is retried once after a long backoff; if that succeeds the run
+  // recovers without reporting any error.
+  state.syncMode = "ok";
+  state.restrictionOnceRemaining = 1;
+  await page.locator(".topbar-actions button", { hasText: "同步关注流" }).click();
+  await page.waitForFunction(() => /已同步|本地保存/.test(document.querySelector(".topbar-status")?.textContent ?? ""), null, { timeout: 90_000 });
+  await waitSettled(page);
+  await page.waitForTimeout(500);
+  check("限流后退避重试可恢复成功", /已同步|本地保存/.test(await statusText(page)), await statusText(page));
+  const retryRecoveredStored = await readStoredState(page);
+  check("退避重试成功后不残留错误", retryRecoveredStored.creators.filter((creator) => creator.syncError).length === 0,
+    `errors=${retryRecoveredStored.creators.filter((creator) => creator.syncError).length}`);
+
   state.syncMode = "restriction";
   await page.locator(".topbar-actions button", { hasText: "同步关注流" }).click();
-  await page.waitForFunction(() => document.querySelector(".sync-progress")?.textContent?.includes("本轮跳过 1"), null, { timeout: 30_000 });
+  await page.waitForFunction(() => document.querySelector(".sync-progress")?.textContent?.includes("本轮跳过 1"), null, { timeout: 90_000 });
   const restrictedProgress = (await page.locator(".sync-progress").first().innerText()).replace(/\s+/g, " ");
   check("限流后区分本轮失败与跳过", /本轮失败 1 · 本轮跳过 1/.test(restrictedProgress), restrictedProgress);
   await page.locator('.main-nav a[href="/following"]').click();
@@ -496,10 +520,11 @@ try {
   const followingProgress = page.locator(".sync-progress.is-compact");
   check("切换页面后保留本轮同步进度", (await followingProgress.count()) === 1 && await followingProgress.isVisible(),
     JSON.stringify(await followingProgress.boundingBox()));
-  const skippedRow = page.locator('.creator-list-card:has(a[href="https://space.bilibili.com/654321"])');
+  const followingRowTexts = await page.locator(".creator-list-card").allInnerTexts();
+  const skippedRowTexts = followingRowTexts.filter((text) => text.includes("本轮未请求"));
   check("跳过博主说明本轮未请求且不再显示旧错误",
-    /本轮未请求（平台访问受限）/.test(await skippedRow.innerText()) && !/最近同步错误/.test(await skippedRow.innerText()),
-    await skippedRow.innerText());
+    skippedRowTexts.length === 1 && skippedRowTexts.every((text) => !text.includes("最近同步错误")),
+    skippedRowTexts.join(" | ") || "no skipped row");
   await page.waitForTimeout(500);
   await shot(page, "03b-sync-restricted-following");
   await page.waitForTimeout(600);
@@ -621,6 +646,7 @@ try {
   page2.on("pageerror", (error) => console.log(`  [pageerror] ${error.message}`));
   installSyncStub(second, state);
   installMetadataStub(second, state);
+  installSessionStub(second, state);
   state.videoSeed = 100;
   state.syncCalls = [];
   state.publishedOffsetMs = 0;
@@ -733,6 +759,23 @@ try {
     check("不再错误地提示启动抓取服务", !cardText.includes("未配置本机同步服务"), cardText);
     state.syncConfigured = true;
     state.syncErrorMessage = "";
+
+    // Expired Bilibili cookie: warn and skip Bilibili instead of hammering the
+    // platform until it answers with a long series of risk-control failures.
+    state.sessionStatus = "logged-out";
+    await page2.locator(".topbar-actions button", { hasText: "同步关注流" }).click();
+    await page2.waitForFunction(() => /Cookie 已失效/.test(document.querySelector(".sync-progress")?.textContent ?? ""), null, { timeout: 30_000 });
+    await waitSettled(page2);
+    await page2.waitForTimeout(500);
+    const cookieBlockedText = (await page2.locator(".sync-progress").first().innerText()).replace(/\s+/g, " ");
+    check("哔站 Cookie 失效时给出明确更新提示",
+      cookieBlockedText.includes("Cookie 已失效") && cookieBlockedText.includes("setup-sidecar"), cookieBlockedText);
+    const cookieBlockedStored = await readStoredState(page2);
+    check("登录失效时哔站博主不被计为错误", cookieBlockedStored.creators.filter((creator) => creator.syncError).length === 0,
+      `errors=${cookieBlockedStored.creators.filter((creator) => creator.syncError).length}`);
+    const blockedRowTexts = await page2.locator(".creator-list-card small").allInnerTexts();
+    check("登录失效时标记为本轮未请求", blockedRowTexts.some((text) => text.includes("本轮未请求")), blockedRowTexts.join(" | "));
+    state.sessionStatus = "logged-in";
     await shot(page2, "06-empty-sync");
   } finally {
     await second.close();

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildSyncBatches, clearSyncErrors, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, mergeSyncResponse, type SyncResponse } from "@/lib/feed-sync";
+import { applyBilibiliRunLimit, buildSyncBatches, clearSyncErrors, getBilibiliCooldownMs, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, MAX_BILIBILI_CREATORS_PER_RUN, mergeSyncResponse, RESTRICTION_RETRY_DELAY_MS, type SyncResponse } from "@/lib/feed-sync";
 import { MAX_FEED_NAME_LENGTH, MAX_FEED_TITLE_LENGTH, migrateFeedState } from "@/lib/feed-storage";
 import type { Creator, FeedState, VideoItem } from "@/lib/feed-types";
 
@@ -265,6 +265,51 @@ describe("Douyin sync pacing", () => {
   it("keeps the cooldown within the configured 8-14 second range", () => {
     expect(getDouyinCooldownMs(() => 0)).toBe(8_000);
     expect(getDouyinCooldownMs(() => 1 - Number.EPSILON)).toBe(14_000);
+  });
+});
+
+describe("Bilibili pacing", () => {
+  it("spaces creators by 3-5 seconds and backs off once on a rate limit", () => {
+    expect(getBilibiliCooldownMs(() => 0)).toBe(3_000);
+    expect(getBilibiliCooldownMs(() => 1 - Number.EPSILON)).toBe(5_000);
+    expect(RESTRICTION_RETRY_DELAY_MS).toBeGreaterThanOrEqual(10_000);
+  });
+});
+
+describe("applyBilibiliRunLimit", () => {
+  const bilibili = (id: string, overrides: Partial<Creator> = {}): Creator => ({
+    ...creator,
+    id,
+    name: id,
+    ...overrides,
+  });
+
+  it("keeps a short Bilibili list untouched and ignores other platforms", () => {
+    const targets = [
+      bilibili("b1"),
+      { ...creator, id: "d1", platform: "douyin" as const, profileUrl: "https://www.douyin.com/user/d1" },
+      bilibili("b2"),
+    ];
+
+    const { planned, deferred } = applyBilibiliRunLimit(targets);
+
+    expect(planned.map((item) => item.id)).toEqual(["b1", "d1", "b2"]);
+    expect(deferred).toEqual([]);
+  });
+
+  it("defers the least urgent Bilibili creators beyond the per-run cap", () => {
+    const targets = Array.from({ length: MAX_BILIBILI_CREATORS_PER_RUN + 5 }, (_, index) => bilibili(`b${index}`, {
+      // b0..b4 already failed, b5..b29 never synced, the rest synced long ago.
+      ...(index < 5 ? { syncError: "风控校验失败" } : {}),
+      ...(index >= 30 ? { lastSyncAt: "2026-10-01T00:00:00.000Z" } : {}),
+    }));
+
+    const { planned, deferred } = applyBilibiliRunLimit(targets);
+
+    expect(planned).toHaveLength(MAX_BILIBILI_CREATORS_PER_RUN);
+    expect(deferred.map((item) => item.id)).toEqual(["b50", "b51", "b52", "b53", "b54"]);
+    // Failed records are scheduled first so retries make progress.
+    expect(planned.slice(0, 5).map((item) => item.id)).toEqual(["b0", "b1", "b2", "b3", "b4"]);
   });
 });
 

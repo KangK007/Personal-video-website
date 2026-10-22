@@ -11,6 +11,10 @@ try {
   try {
     const page = await context.newPage();
     const syncBatches = [];
+    await page.route("**/api/bilibili/session", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ status: "logged-in" }),
+    }));
     await page.route("**/api/feed/sync", (route) => {
       const batch = route.request().postDataJSON().creators;
       syncBatches.push(batch.map((creator) => creator.profileUrl));
