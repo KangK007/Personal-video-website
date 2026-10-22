@@ -22,7 +22,12 @@ import {
   markBatchFailed,
   mergeSyncResponse,
   buildSyncBatches,
+  clearSyncErrors,
+  getBilibiliCooldownMs,
   getDouyinCooldownMs,
+  getRestrictedSyncPlatform,
+  isProviderUnavailableFailure,
+  MAX_CONSECUTIVE_PROVIDER_FAILURES,
   requestSyncBatch,
   syncRequestError,
   waitWithSignal,
@@ -70,10 +75,13 @@ const EMPTY_PROGRESS: SyncProgress = {
   processed: 0,
   succeeded: 0,
   failed: 0,
+  skipped: 0,
+  restrictedPlatforms: [],
   currentStart: 0,
   currentEnd: 0,
   message: "",
   failedCreatorIds: [],
+  skippedCreatorIds: [],
   runId: 0,
 };
 
@@ -124,6 +132,8 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   const abortRef = useRef<AbortController | null>(null);
   const syncingRef = useRef(false);
   const autoSyncStartedRef = useRef(false);
+  const autoSyncSeenIdsRef = useRef(new Set<string>());
+  const pendingAutoSyncIdsRef = useRef(new Set<string>());
   const failedIdsRef = useRef<string[]>([]);
 
   useEffect(() => {
@@ -171,6 +181,8 @@ export function FeedProvider({ children }: { children: ReactNode }) {
 
   const replaceState = useCallback((next: FeedState) => {
     dataEpochRef.current += 1;
+    autoSyncSeenIdsRef.current = new Set(next.creators.map((creator) => creator.id));
+    pendingAutoSyncIdsRef.current.clear();
     creatorsRef.current = next.creators;
     videosRef.current = next.videos;
     setCreatorsState(next.creators);
@@ -407,9 +419,26 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       let processed = 0;
       let succeeded = 0;
       let failed = 0;
+      let skipped = 0;
       let incomingCount = 0;
+      const skippedCreatorIds: string[] = [];
+      const restrictedPlatforms = new Set<Creator["platform"]>();
       let interrupted = false;
       let stateChanged = false;
+      let consecutiveProviderFailures = 0;
+      let providerInterrupted = false;
+
+      const applyCreators = (next: Creator[]) => {
+        creatorsRef.current = next;
+        setCreatorsState(next);
+        stateChanged = true;
+      };
+
+      const clearErrorsFor = (ids: string[]) => {
+        if (!ids.length) return;
+        const cleared = clearSyncErrors({ creators: creatorsRef.current, videos: videosRef.current }, ids);
+        if (cleared.creators !== creatorsRef.current) applyCreators(cleared.creators);
+      };
 
       const publish = (patch: Partial<SyncProgress>) => {
         setSyncProgress((current) => ({
@@ -420,22 +449,35 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           processed,
           succeeded,
           failed,
+          skipped,
           runId,
         }));
       };
 
-      publish({ status: "loading", message: `准备同步 ${targets.length} 位博主`, failedCreatorIds: [] });
+      publish({ status: "loading", message: `准备同步 ${targets.length} 位博主`, failedCreatorIds: [], skippedCreatorIds: [] });
 
       try {
         const batches = buildSyncBatches(targets);
         for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
           const batch = batches[batchIndex];
+          if (restrictedPlatforms.has(batch[0].platform)) {
+            skipped += batch.length;
+            processed += batch.length;
+            skippedCreatorIds.push(...batch.map((creator) => creator.id));
+            // A skipped creator was not attempted in this run, so an error from an
+            // earlier run must not keep counting as a current failure.
+            clearErrorsFor(batch.map((creator) => creator.id));
+            publish({ message: `本轮已跳过访问受限的${batch[0].platform === "douyin" ? "抖音" : "哔站"}博主`, skippedCreatorIds: [...skippedCreatorIds] });
+            continue;
+          }
           const batchStart = processed + 1;
           const batchEnd = processed + batch.length;
           const currentNames = batch.slice(0, 2).map((creator) => creator.name).join("、");
           const nameSuffix = batch.length > 2 ? "等" : "";
           const hasAnotherDouyinBatch = batch[0]?.platform === "douyin"
             && batches.slice(batchIndex + 1).some((nextBatch) => nextBatch[0]?.platform === "douyin");
+          const hasAnotherBilibiliBatch = batch[0]?.platform === "bilibili"
+            && batches.slice(batchIndex + 1).some((nextBatch) => nextBatch[0]?.platform === "bilibili");
           publish({ currentStart: batchStart, currentEnd: batchEnd, message: `正在同步第 ${batchStart}-${batchEnd} 位博主：${currentNames}${nameSuffix}` });
 
           let data;
@@ -460,9 +502,19 @@ export function FeedProvider({ children }: { children: ReactNode }) {
             failed += batch.length;
             processed += batch.length;
             failedIdsRef.current = Array.from(new Set([...failedIdsRef.current, ...batch.map((creator) => creator.id)]));
+            consecutiveProviderFailures += 1;
+            if (consecutiveProviderFailures >= MAX_CONSECUTIVE_PROVIDER_FAILURES) {
+              // The provider is down: do not label every remaining creator as failed.
+              providerInterrupted = true;
+              interrupted = true;
+              publish({ message: `同步服务连续 ${consecutiveProviderFailures} 次请求失败，已停止本轮同步；剩余博主未标记为失败，可直接重试` });
+              break;
+            }
             publish({ message: `第 ${batchStart}-${batchEnd} 位同步失败，继续处理后续博主` });
             if (hasAnotherDouyinBatch) {
               await waitWithSignal(getDouyinCooldownMs(), controller.signal);
+            } else if (hasAnotherBilibiliBatch) {
+              await waitWithSignal(getBilibiliCooldownMs(), controller.signal);
             }
             continue;
           }
@@ -484,24 +536,50 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           processed += batch.length;
           incomingCount += merged.incomingCount;
           failedIdsRef.current = Array.from(new Set([...failedIdsRef.current, ...merged.failedCreatorIds]));
-          publish({ message: `已处理 ${processed}/${targets.length} 位博主，读取 ${incomingCount} 条视频` });
-          if (hasAnotherDouyinBatch) {
+          const restrictedPlatform = getRestrictedSyncPlatform(batch, data);
+          if (restrictedPlatform) restrictedPlatforms.add(restrictedPlatform);
+          if (isProviderUnavailableFailure(data)) {
+            consecutiveProviderFailures += 1;
+            if (consecutiveProviderFailures >= MAX_CONSECUTIVE_PROVIDER_FAILURES) {
+              providerInterrupted = true;
+              interrupted = true;
+              publish({ message: `同步服务连续 ${consecutiveProviderFailures} 次不可用，已停止本轮同步；剩余博主未标记为失败，可直接重试` });
+              break;
+            }
+          } else {
+            consecutiveProviderFailures = 0;
+          }
+          publish({
+            message: restrictedPlatform
+              ? `${restrictedPlatform === "douyin" ? "抖音" : "哔站"}触发访问限制，已停止该平台后续请求`
+              : `已处理 ${processed}/${targets.length} 位博主，读取 ${incomingCount} 条视频`,
+            restrictedPlatforms: Array.from(restrictedPlatforms),
+          });
+          if (hasAnotherDouyinBatch && !restrictedPlatform) {
             await waitWithSignal(getDouyinCooldownMs(), controller.signal);
+          } else if (hasAnotherBilibiliBatch && !restrictedPlatform) {
+            await waitWithSignal(getBilibiliCooldownMs(), controller.signal);
           }
         }
 
         if (interrupted) {
-          const message = controller.signal.aborted ? "同步已取消；已有缓存已保留" : "数据在同步期间发生变化，已停止应用后续结果";
+          const message = providerInterrupted
+            ? `同步服务连续 ${consecutiveProviderFailures} 次失败或不稳定，已停止本轮同步；未处理的博主可直接重试`
+            : controller.signal.aborted
+              ? "同步已取消；已有缓存已保留"
+              : "数据在同步期间发生变化，已停止应用后续结果";
           const status: SyncStatus = controller.signal.aborted && processed > 0 ? "partial" : "error";
-          publish({ status, message, currentStart: 0, currentEnd: 0 });
+          publish({ status, message, currentStart: 0, currentEnd: 0, failedCreatorIds: failedIdsRef.current, skippedCreatorIds });
           return false;
         }
 
-        const status: SyncStatus = failed === 0 ? "success" : succeeded > 0 ? "partial" : "error";
-        const message = failed === 0
+        const status: SyncStatus = failed === 0 && skipped === 0 ? "success" : succeeded > 0 ? "partial" : "error";
+        const message = skipped > 0
+          ? `已读取 ${incomingCount} 条；平台访问受限，本轮跳过 ${skipped} 位博主，稍后可重试`
+          : failed === 0
           ? `同步完成，读取 ${incomingCount} 条视频`
-          : `${succeeded ? `已读取 ${incomingCount} 条，` : ""}${failed} 位博主同步失败，可在关注列表重试`;
-        publish({ status, message, currentStart: 0, currentEnd: 0, failedCreatorIds: failedIdsRef.current });
+          : `${succeeded ? `已读取 ${incomingCount} 条，` : ""}${failed} 位博主同步失败，可重试`;
+        publish({ status, message, currentStart: 0, currentEnd: 0, failedCreatorIds: failedIdsRef.current, skippedCreatorIds });
         return failed === 0;
       } catch (error) {
         const message = syncRequestError(error);
@@ -527,15 +605,25 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   }, [markDirty]);
 
   useEffect(() => {
-    if (autoSyncStartedRef.current) return;
     if (!dataAvailable || (storageStatus !== "ready" && storageStatus !== "empty")) return;
-    // Do not consume the once-per-page-load auto sync while no creator can be synced:
-    // the first run adds creators after hydration and must still sync without a reload.
-    if (!creatorsRef.current.some((creator) => creator.enabled)) return;
+    const newlyAdded = creatorsRef.current.filter((creator) => !autoSyncSeenIdsRef.current.has(creator.id));
+    newlyAdded.forEach((creator) => autoSyncSeenIdsRef.current.add(creator.id));
+    if (!autoSyncStartedRef.current) {
+      // Empty and fully paused lists leave the first automatic run available.
+      if (!creatorsRef.current.some((creator) => creator.enabled)) return;
+      autoSyncStartedRef.current = true;
+      // A previous rate-limit error must not disable automatic sync forever: the run
+      // stops itself on the first restriction and skipped records are not re-labeled.
+      void syncFeed();
+      return;
+    }
 
-    autoSyncStartedRef.current = true;
-    void syncFeed();
-  }, [creators, dataAvailable, storageStatus, syncFeed]);
+    newlyAdded.filter((creator) => creator.enabled).forEach((creator) => pendingAutoSyncIdsRef.current.add(creator.id));
+    if (syncingRef.current || !pendingAutoSyncIdsRef.current.size) return;
+    const targets = creatorsRef.current.filter((creator) => creator.enabled && pendingAutoSyncIdsRef.current.has(creator.id));
+    pendingAutoSyncIdsRef.current.clear();
+    if (targets.length) void syncFeed(targets);
+  }, [creators, dataAvailable, storageStatus, syncProgress.status, syncFeed]);
 
   const cancelSync = useCallback(() => {
     if (!syncingRef.current) return;
@@ -543,8 +631,18 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const retryFailed = useCallback(() => {
+    // Prefer the stored errors so the action also works after a page reload, when
+    // the in-memory list of the last run is gone.
     const ids = new Set(failedIdsRef.current);
-    const targets = creatorsRef.current.filter((creator) => ids.has(creator.id) && creator.enabled);
+    const targets = creatorsRef.current.filter((creator) => (
+      creator.enabled && (ids.has(creator.id) || Boolean(creator.syncError))
+    ));
+    if (!targets.length) {
+      const runId = runIdRef.current + 1;
+      runIdRef.current = runId;
+      setSyncProgress({ ...EMPTY_PROGRESS, status: "success", message: "当前没有同步失败的博主", runId });
+      return Promise.resolve(false);
+    }
     return syncFeed(targets);
   }, [syncFeed]);
 

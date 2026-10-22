@@ -2,6 +2,9 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   openDouyinBrowserSession: vi.fn(),
+  probeSidecar: vi.fn(),
+  syncBilibiliCreator: vi.fn(),
+  sidecarBaseUrl: null as string | null,
 }));
 
 vi.mock("server-only", () => ({}));
@@ -23,9 +26,15 @@ vi.mock("@/lib/douyin-browser", () => ({
 }));
 
 vi.mock("@/lib/server/bilibili-sync", () => ({
-  getSidecarBaseUrl: () => null,
-  probeSidecar: vi.fn(),
-  syncBilibiliCreator: vi.fn(),
+  getSidecarBaseUrl: () => mocks.sidecarBaseUrl,
+  isRetryableSidecarError: (error: unknown) => (
+    error instanceof Error
+    && "retryable" in error
+    && error.retryable === true
+    && !("status" in error && error.status === 429)
+  ),
+  probeSidecar: mocks.probeSidecar,
+  syncBilibiliCreator: mocks.syncBilibiliCreator,
 }));
 
 let POST: typeof import("@/app/api/feed/sync/route").POST;
@@ -38,6 +47,9 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   mocks.openDouyinBrowserSession.mockReset();
+  mocks.probeSidecar.mockReset();
+  mocks.syncBilibiliCreator.mockReset();
+  mocks.sidecarBaseUrl = null;
 });
 
 function creator(id: string) {
@@ -73,6 +85,164 @@ function posts(videoId = "1234567890123456789") {
 }
 
 describe("feed sync route cancellation and cleanup", () => {
+  it("stops requesting Bilibili creators after a rate-limit response but continues Douyin", async () => {
+    mocks.sidecarBaseUrl = "http://127.0.0.1:8001";
+    mocks.probeSidecar.mockResolvedValue(undefined);
+    mocks.syncBilibiliCreator.mockRejectedValue(new Error("风控校验失败"));
+    const fetchUserPosts = vi.fn().mockResolvedValue(posts());
+    const close = vi.fn().mockResolvedValue(undefined);
+    mocks.openDouyinBrowserSession.mockResolvedValue({ fetchUserPosts, close });
+
+    const response = await POST(syncRequest([
+      { id: "bili-1", platform: "bilibili", profileUrl: "https://space.bilibili.com/123456", name: "博主一" },
+      { id: "bili-2", platform: "bilibili", profileUrl: "https://space.bilibili.com/654321", name: "博主二" },
+      creator("douyin-1"),
+    ]));
+    const body = await response.json() as { results: Array<{ failureCode?: string; status: string }> };
+
+    expect(response.status).toBe(200);
+    expect(body.results.map((result) => result.failureCode)).toEqual([
+      "bilibili_rate_limited", "bilibili_circuit_open", undefined,
+    ]);
+    expect(body.results[2].status).toBe("success");
+    expect(mocks.syncBilibiliCreator).toHaveBeenCalledTimes(1);
+    expect(fetchUserPosts).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks transient sidecar probe failures as retryable provider failures", async () => {
+    mocks.sidecarBaseUrl = "http://127.0.0.1:8001";
+    mocks.probeSidecar.mockRejectedValue(new Error("哔站本机抓取服务未启动或无法连接"));
+
+    const response = await POST(syncRequest([{
+      id: "bili-1",
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "博主一",
+    }]));
+    const body = await response.json() as { results: Array<{ failureCode?: string }> };
+
+    expect(response.status).toBe(502);
+    expect(body.results[0].failureCode).toBe("provider_unavailable");
+  });
+
+  it("keeps a detailed sidecar probe 5xx retryable after fan-out to creators", async () => {
+    mocks.sidecarBaseUrl = "http://127.0.0.1:8001";
+    mocks.probeSidecar.mockRejectedValue(
+      Object.assign(new Error("Internal Server Error"), { status: 500, retryable: true }),
+    );
+
+    const response = await POST(syncRequest([{
+      id: "bili-1",
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "博主一",
+    }]));
+    const body = await response.json() as {
+      results: Array<{ failureCode?: string; message?: string }>;
+    };
+
+    expect(response.status).toBe(502);
+    expect(body.results[0]).toMatchObject({
+      failureCode: "provider_unavailable",
+      message: "Internal Server Error",
+    });
+    expect(mocks.syncBilibiliCreator).not.toHaveBeenCalled();
+  });
+
+  it("does not mark a missing sidecar configuration as a transient failure", async () => {
+    const response = await POST(syncRequest([{
+      id: "bili-1",
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "博主一",
+    }]));
+    const body = await response.json() as { results: Array<{ failureCode?: string; message?: string }> };
+
+    expect(response.status).toBe(502);
+    expect(body.results[0].failureCode).toBeUndefined();
+    expect(body.results[0].message).toContain("未配置哔站本机抓取服务");
+  });
+
+  it("marks a detailed exhausted sidecar 5xx as a retryable provider failure", async () => {
+    mocks.sidecarBaseUrl = "http://127.0.0.1:8001";
+    mocks.probeSidecar.mockResolvedValue(undefined);
+    mocks.syncBilibiliCreator.mockRejectedValue(
+      Object.assign(new Error("Internal Server Error"), { status: 500, retryable: true }),
+    );
+
+    const response = await POST(syncRequest([{
+      id: "bili-1",
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "博主一",
+    }]));
+    const body = await response.json() as {
+      results: Array<{ failureCode?: string; message?: string }>;
+    };
+
+    expect(response.status).toBe(502);
+    expect(body.results[0]).toMatchObject({
+      failureCode: "provider_unavailable",
+      message: "Internal Server Error",
+    });
+  });
+
+  it("does not classify a sidecar 4xx as a retryable provider failure", async () => {
+    mocks.sidecarBaseUrl = "http://127.0.0.1:8001";
+    mocks.probeSidecar.mockResolvedValue(undefined);
+    mocks.syncBilibiliCreator.mockRejectedValue(
+      Object.assign(new Error("Bad Request"), { status: 400, retryable: false }),
+    );
+
+    const response = await POST(syncRequest([{
+      id: "bili-1",
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "博主一",
+    }]));
+    const body = await response.json() as { results: Array<{ failureCode?: string; message?: string }> };
+
+    expect(body.results[0]).toMatchObject({ message: "Bad Request" });
+    expect(body.results[0].failureCode).toBeUndefined();
+  });
+
+  it("treats a sidecar 429 as a platform restriction without immediate retry", async () => {
+    mocks.sidecarBaseUrl = "http://127.0.0.1:8001";
+    mocks.probeSidecar.mockResolvedValue(undefined);
+    mocks.syncBilibiliCreator.mockRejectedValue(
+      Object.assign(new Error("Too Many Requests"), { status: 429, retryable: false }),
+    );
+
+    const response = await POST(syncRequest([{
+      id: "bili-1",
+      platform: "bilibili",
+      profileUrl: "https://space.bilibili.com/123456",
+      name: "博主一",
+    }]));
+    const body = await response.json() as { results: Array<{ failureCode?: string; message?: string }> };
+
+    expect(body.results[0]).toMatchObject({ message: "Too Many Requests" });
+    expect(body.results[0].failureCode).toBe("bilibili_rate_limited");
+  });
+
+  it("does not classify Douyin pagination timeouts as local provider failures", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    mocks.openDouyinBrowserSession.mockResolvedValue({
+      fetchUserPosts: vi.fn().mockRejectedValue(new Error("抖音分页加载超时，未完整同步")),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const pending = POST(syncRequest([creator("douyin-1")]));
+    await vi.advanceTimersByTimeAsync(45_000);
+    const response = await pending;
+    const body = await response.json() as { results: Array<{ failureCode?: string }> };
+
+    expect(response.status).toBe(502);
+    expect(body.results[0].failureCode).toBeUndefined();
+  });
+
   it("rejects two creator IDs that point to the same profile", async () => {
     const response = await POST(syncRequest([
       creator("same-user"),

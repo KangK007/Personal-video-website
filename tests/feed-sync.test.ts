@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildSyncBatches, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, mergeSyncResponse, type SyncResponse } from "@/lib/feed-sync";
+import { buildSyncBatches, clearSyncErrors, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, mergeSyncResponse, type SyncResponse } from "@/lib/feed-sync";
 import { MAX_FEED_NAME_LENGTH, MAX_FEED_TITLE_LENGTH, migrateFeedState } from "@/lib/feed-storage";
 import type { Creator, FeedState, VideoItem } from "@/lib/feed-types";
 
@@ -175,7 +175,7 @@ describe("mergeSyncResponse", () => {
 });
 
 describe("buildSyncBatches", () => {
-  it("keeps Douyin batches to three creators and Bilibili batches to ten", () => {
+  it("keeps Douyin batches to three creators and paces Bilibili one creator at a time", () => {
     const creators: Creator[] = [
       ...Array.from({ length: 11 }, (_, index) => ({
         ...creator,
@@ -186,10 +186,39 @@ describe("buildSyncBatches", () => {
     ];
 
     expect(buildSyncBatches(creators).map((batch) => batch.map((item) => item.id))).toEqual([
-      Array.from({ length: 10 }, (_, index) => `bilibili-${index}`),
-      ["bilibili-10"],
+      ...Array.from({ length: 11 }, (_, index) => [`bilibili-${index}`]),
       ["douyin-1", "douyin-2"],
     ]);
+  });
+
+  it("recognizes platform restrictions without treating transient provider outages as rate limits", () => {
+    const bilibili = { ...creator, id: "bili" };
+    const douyin = { ...creator, id: "douyin", platform: "douyin" as const };
+    expect(getRestrictedSyncPlatform([bilibili], {
+      results: [{ creatorId: "bili", status: "error", failureCode: "bilibili_rate_limited" }],
+    })).toBe("bilibili");
+    expect(getRestrictedSyncPlatform([douyin], {
+      results: [{ creatorId: "douyin", status: "error", failureCode: "douyin_circuit_open" }],
+    })).toBe("douyin");
+    expect(getRestrictedSyncPlatform([bilibili], {
+      results: [{ creatorId: "bili", status: "error", failureCode: "provider_unavailable" }],
+    })).toBeNull();
+  });
+
+  it("detects a provider outage without confusing it with a per-creator failure", () => {
+    expect(isProviderUnavailableFailure({
+      results: [{ creatorId: "a", status: "error", failureCode: "provider_unavailable" }],
+    })).toBe(true);
+    expect(isProviderUnavailableFailure({
+      results: [
+        { creatorId: "a", status: "error", failureCode: "provider_unavailable" },
+        { creatorId: "b", status: "success" },
+      ],
+    })).toBe(false);
+    expect(isProviderUnavailableFailure({
+      results: [{ creatorId: "a", status: "error", failureCode: "bilibili_rate_limited" }],
+    })).toBe(false);
+    expect(isProviderUnavailableFailure({ results: [] })).toBe(false);
   });
 
   it("does not mix adjacent platforms in a batch", () => {
@@ -236,5 +265,31 @@ describe("Douyin sync pacing", () => {
   it("keeps the cooldown within the configured 8-14 second range", () => {
     expect(getDouyinCooldownMs(() => 0)).toBe(8_000);
     expect(getDouyinCooldownMs(() => 1 - Number.EPSILON)).toBe(14_000);
+  });
+});
+
+describe("clearSyncErrors", () => {
+  const restrictedError = "风控校验失败";
+
+  it("clears stale errors for records a new run skips", () => {
+    const state = {
+      creators: [
+        { ...creator, id: "skipped", syncError: restrictedError },
+        { ...creator, id: "attempted", syncError: restrictedError },
+        { ...creator, id: "healthy" },
+      ],
+      videos: [],
+    };
+
+    const cleared = clearSyncErrors(state, ["skipped"]);
+
+    expect(cleared.creators.map((item) => item.syncError)).toEqual([undefined, restrictedError, undefined]);
+    expect(cleared.creators[0].id).toBe("skipped");
+  });
+
+  it("returns the same state when nothing needs clearing", () => {
+    const state = { creators: [{ ...creator, id: "healthy" }], videos: [] };
+    expect(clearSyncErrors(state, ["healthy"])).toBe(state);
+    expect(clearSyncErrors(state, ["missing"])).toBe(state);
   });
 });

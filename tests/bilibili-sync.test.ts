@@ -217,6 +217,48 @@ describe("syncBilibiliCreator", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("preserves the HTTP status after a detailed transient response exhausts retries", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ detail: "Internal Server Error" }, 500))
+      .mockResolvedValueOnce(jsonResponse({ detail: "Internal Server Error" }, 500))
+      .mockResolvedValueOnce(jsonResponse({ detail: "Internal Server Error" }, 500));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      syncedAt,
+    );
+    const rejection = expect(pending).rejects.toMatchObject({
+      message: "Internal Server Error",
+      status: 500,
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_100);
+
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not mark a non-transient sidecar client error as retryable", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse({ detail: "Bad Request" }, 400),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      syncedAt,
+    )).rejects.toMatchObject({
+      message: "Bad Request",
+      status: 400,
+      retryable: false,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("honors an already-aborted synchronization signal", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

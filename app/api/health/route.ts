@@ -67,14 +67,36 @@ async function probeSidecar(baseUrl: string | null) {
     const authProbeUrl = new URL("__local_auth_probe__", `${baseUrl}/`);
     const unauthenticatedResponse = await probeFetch(authProbeUrl);
     await discardBody(unauthenticatedResponse);
-    const authResponse = await probeFetch(authProbeUrl, token);
-    await discardBody(authResponse);
     if (unauthenticatedResponse.status !== 401) {
+      if (
+        unauthenticatedResponse.status === 408
+        || unauthenticatedResponse.status === 429
+        || unauthenticatedResponse.status >= 500
+      ) {
+        return {
+          configured: true,
+          healthy: false,
+          message: `本机抓取服务返回 ${unauthenticatedResponse.status}`,
+        };
+      }
       return { configured: true, healthy: false, message: "本机抓取服务未启用鉴权" };
     }
-    return authResponse.status === 401
-      ? { configured: true, healthy: false, message: "本机抓取服务令牌不匹配，请重新运行设置脚本" }
-      : { configured: true, healthy: true };
+    const authResponse = await probeFetch(authProbeUrl, token);
+    await discardBody(authResponse);
+    if (authResponse.status === 401 || authResponse.status === 403) {
+      return { configured: true, healthy: false, message: "本机抓取服务令牌不匹配，请重新运行设置脚本" };
+    }
+    if (authResponse.status === 408 || authResponse.status === 429 || authResponse.status >= 500) {
+      return {
+        configured: true,
+        healthy: false,
+        message: `本机抓取服务返回 ${authResponse.status}`,
+      };
+    }
+    if (authResponse.ok || authResponse.status === 404) {
+      return { configured: true, healthy: true };
+    }
+    return { configured: true, healthy: false, message: "本机抓取服务鉴权探针异常" };
   } catch (error) {
     const message = error instanceof Error && error.name === "AbortError"
       ? "本机抓取服务响应超时"

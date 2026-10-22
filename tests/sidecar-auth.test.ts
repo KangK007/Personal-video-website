@@ -3,11 +3,12 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 vi.mock("server-only", () => ({}));
 
 let getSidecarBaseUrl: typeof import("@/lib/server/bilibili-sync").getSidecarBaseUrl;
+let isRetryableSidecarError: typeof import("@/lib/server/bilibili-sync").isRetryableSidecarError;
 let probeSidecar: typeof import("@/lib/server/bilibili-sync").probeSidecar;
 let syncBilibiliCreator: typeof import("@/lib/server/bilibili-sync").syncBilibiliCreator;
 
 beforeAll(async () => {
-  ({ getSidecarBaseUrl, probeSidecar, syncBilibiliCreator } = await import("@/lib/server/bilibili-sync"));
+  ({ getSidecarBaseUrl, isRetryableSidecarError, probeSidecar, syncBilibiliCreator } = await import("@/lib/server/bilibili-sync"));
 });
 
 afterEach(() => {
@@ -84,6 +85,44 @@ describe("probeSidecar", () => {
     await expect(probeSidecar("http://127.0.0.1:8001")).resolves.toBeUndefined();
   });
 
+  it("preserves a transient status when the unauthenticated auth probe returns 5xx", async () => {
+    vi.stubEnv("FEED_SIDECAR_TOKEN", "matching-token");
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: "Internal Server Error" }), { status: 500 })));
+
+    await expect(probeSidecar("http://127.0.0.1:8001")).rejects.toMatchObject({
+      message: "抓取服务返回 500",
+      status: 500,
+      retryable: true,
+    });
+  });
+
+  it("preserves a transient status when the authenticated auth probe returns 5xx", async () => {
+    vi.stubEnv("FEED_SIDECAR_TOKEN", "matching-token");
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: "Bad Gateway" }), { status: 502 })));
+
+    await expect(probeSidecar("http://127.0.0.1:8001")).rejects.toMatchObject({
+      message: "抓取服务返回 502",
+      status: 502,
+      retryable: true,
+    });
+  });
+
+  it("does not accept an unexpected authenticated auth-probe response", async () => {
+    vi.stubEnv("FEED_SIDECAR_TOKEN", "matching-token");
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(null, { status: 400 })));
+
+    await expect(probeSidecar("http://127.0.0.1:8001"))
+      .rejects.toThrow("本机抓取服务鉴权探针异常");
+  });
+
   it("maps a rejected bearer token during pagination to the same actionable message", async () => {
     vi.stubEnv("FEED_SIDECAR_TOKEN", "wrong-token");
     vi.stubGlobal("fetch", sidecarFetch("right-token"));
@@ -93,5 +132,24 @@ describe("probeSidecar", () => {
       creator,
       "2026-09-13T12:00:00.000Z",
     )).rejects.toThrow("令牌不匹配");
+  });
+
+  it("does not retry a sidecar 429 automatically", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: "Too Many Requests" }), { status: 429 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await syncBilibiliCreator(
+      "http://127.0.0.1:8001",
+      creator,
+      "2026-09-13T12:00:00.000Z",
+    ).catch((value: unknown) => value);
+    expect(error).toMatchObject({
+      message: "Too Many Requests",
+      status: 429,
+      retryable: false,
+    });
+    expect(isRetryableSidecarError(error)).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

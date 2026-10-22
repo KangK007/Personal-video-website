@@ -28,6 +28,24 @@ const SIDECAR_HEALTH_TIMEOUT_MS = 2_000;
 const MAX_BILIBILI_PAGES = 1_000;
 const MAX_BILIBILI_VIDEOS = 150_000;
 
+function isRetryableSidecarStatus(status: number) {
+  return status === 408 || (status >= 500 && status <= 599);
+}
+
+export class SidecarRequestError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "SidecarRequestError";
+    this.retryable = isRetryableSidecarStatus(status);
+  }
+}
+
+export function isRetryableSidecarError(error: unknown): error is SidecarRequestError {
+  return error instanceof SidecarRequestError && error.retryable;
+}
+
 function isLoopbackHost(hostname: string) {
   return hostname === "localhost"
     || hostname === "127.0.0.1"
@@ -108,7 +126,9 @@ async function probeRequest(url: URL, token: string | null, signal?: AbortSignal
 export async function probeSidecar(baseUrl: string, signal?: AbortSignal) {
   const openApiResponse = await probeRequest(new URL("openapi.json", `${baseUrl}/`), null, signal);
   await discardBody(openApiResponse);
-  if (!openApiResponse.ok) throw new Error(`抓取服务返回 ${openApiResponse.status}`);
+  if (!openApiResponse.ok) {
+    throw new SidecarRequestError(`抓取服务返回 ${openApiResponse.status}`, openApiResponse.status);
+  }
 
   const token = process.env.FEED_SIDECAR_TOKEN?.trim();
   if (!token) {
@@ -118,11 +138,21 @@ export async function probeSidecar(baseUrl: string, signal?: AbortSignal) {
   const unauthenticated = await probeRequest(authProbeUrl, null, signal);
   await discardBody(unauthenticated);
   if (unauthenticated.status !== 401) {
+    if (unauthenticated.status === 408 || unauthenticated.status === 429 || unauthenticated.status >= 500) {
+      throw new SidecarRequestError(`抓取服务返回 ${unauthenticated.status}`, unauthenticated.status);
+    }
     throw new Error("本机抓取服务未启用鉴权，请重新运行本机抓取服务配置脚本");
   }
   const authenticated = await probeRequest(authProbeUrl, token, signal);
   await discardBody(authenticated);
   if (authenticated.status === 401) throw new Error(TOKEN_MISMATCH_MESSAGE);
+  if (authenticated.status === 408 || authenticated.status === 429 || authenticated.status >= 500) {
+    throw new SidecarRequestError(`抓取服务返回 ${authenticated.status}`, authenticated.status);
+  }
+  if (authenticated.status === 403) throw new Error(TOKEN_MISMATCH_MESSAGE);
+  if (!authenticated.ok && authenticated.status !== 404) {
+    throw new Error("本机抓取服务鉴权探针异常");
+  }
 }
 
 function assertSuccessfulPayload(value: unknown) {
@@ -187,9 +217,11 @@ async function fetchSidecarJson(
         } catch {
           // The status code is enough when the sidecar does not return JSON.
         }
-        const error = new Error(detail || `抓取服务返回 ${response.status}`);
-        if (attempt + 1 < MAX_SIDECAR_ATTEMPTS
-          && (response.status === 408 || response.status === 429 || response.status >= 500)) {
+        const error = new SidecarRequestError(
+          detail || `抓取服务返回 ${response.status}`,
+          response.status,
+        );
+        if (attempt + 1 < MAX_SIDECAR_ATTEMPTS && error.retryable) {
           lastError = error;
           await waitWithSignal(RETRY_DELAY_MS * (attempt + 1), signal);
           continue;
@@ -208,6 +240,7 @@ async function fetchSidecarJson(
         await waitWithSignal(RETRY_DELAY_MS * (attempt + 1), signal);
         continue;
       }
+      if (lastError instanceof SidecarRequestError) throw lastError;
       throw new Error(sidecarErrorMessage(lastError));
     } finally {
       clearTimeout(timeout);

@@ -24,10 +24,13 @@ export type SyncProgress = {
   processed: number;
   succeeded: number;
   failed: number;
+  skipped: number;
+  restrictedPlatforms: Platform[];
   currentStart: number;
   currentEnd: number;
   message: string;
   failedCreatorIds: string[];
+  skippedCreatorIds: string[];
   runId: number;
 };
 
@@ -59,19 +62,24 @@ export type SyncMergeResult = SyncStateSnapshot & {
   succeededCount: number;
 };
 
-export const SYNC_BATCH_SIZE = 10;
+export const SYNC_BATCH_SIZE = 1;
 export const DOUYIN_SYNC_BATCH_SIZE = 3;
 export const DOUYIN_CIRCUIT_BREAKER_THRESHOLD = 3;
+/** Consecutive request/provider failures after which the remaining run is stopped. */
+export const MAX_CONSECUTIVE_PROVIDER_FAILURES = 3;
 export const MAX_KNOWN_DOUYIN_VIDEO_IDS = 100;
 export const SYNC_REQUEST_TIMEOUT_MS = 20 * 60 * 1000;
 export const SYNC_RETRY_DELAY_MS = 1_200;
 const DOUYIN_COOLDOWN_MIN_MS = 8_000;
 const DOUYIN_COOLDOWN_RANGE_MS = 6_000;
+const BILIBILI_COOLDOWN_MS = 1_500;
 const DOUYIN_RESTRICTION_CODES = new Set([
   "douyin_empty_response",
   "douyin_invalid_response",
   "douyin_rate_limited",
+  "douyin_circuit_open",
 ]);
+const BILIBILI_RESTRICTION_CODES = new Set(["bilibili_rate_limited", "bilibili_circuit_open"]);
 
 export function buildSyncBatches(creators: Creator[]) {
   const batches: Creator[][] = [];
@@ -96,10 +104,51 @@ export function getDouyinCooldownMs(random = Math.random) {
   return DOUYIN_COOLDOWN_MIN_MS + Math.floor(random() * (DOUYIN_COOLDOWN_RANGE_MS + 1));
 }
 
+export function getBilibiliCooldownMs() {
+  return BILIBILI_COOLDOWN_MS;
+}
+
 export function isDouyinRestrictionFailure(result: NonNullable<SyncResponse["results"]>[number]) {
   return result.status === "error"
     && typeof result.failureCode === "string"
     && DOUYIN_RESTRICTION_CODES.has(result.failureCode);
+}
+
+export function getRestrictedSyncPlatform(batch: Creator[], data: SyncResponse): Platform | null {
+  for (const result of data.results ?? []) {
+    if (result.status !== "error" || typeof result.failureCode !== "string") continue;
+    const creator = batch.find((item) => item.id === result.creatorId);
+    if (creator?.platform === "douyin" && DOUYIN_RESTRICTION_CODES.has(result.failureCode)) return "douyin";
+    if (creator?.platform === "bilibili" && BILIBILI_RESTRICTION_CODES.has(result.failureCode)) return "bilibili";
+  }
+  return null;
+}
+
+/** True when every creator in the answered batch failed because the provider itself was down. */
+export function isProviderUnavailableFailure(data: SyncResponse): boolean {
+  const results = data.results ?? [];
+  return results.length > 0
+    && results.every((result) => result.status === "error" && result.failureCode === "provider_unavailable");
+}
+
+/**
+ * Clears stale per-creator sync errors for records a run no longer reports as failed.
+ * Without this, a creator that is skipped because its platform is rate limited keeps
+ * its previous error forever and the error count can never recover.
+ */
+export function clearSyncErrors(state: SyncStateSnapshot, ids: Iterable<string>): SyncStateSnapshot {
+  const targets = new Set(ids);
+  if (!state.creators.some((creator) => creator.syncError && targets.has(creator.id))) {
+    return state;
+  }
+  return {
+    creators: state.creators.map((creator) => (
+      targets.has(creator.id) && creator.syncError
+        ? { ...creator, syncError: undefined }
+        : creator
+    )),
+    videos: state.videos,
+  };
 }
 
 export function collectKnownDouyinVideoIds(videos: VideoItem[], creatorId: string) {
@@ -183,6 +232,37 @@ function isRetryableSyncRequestError(error: unknown) {
   return error instanceof Error && /HTTP (408|429|5\d\d)|返回异常|超时/.test(error.message);
 }
 
+function getRetryableProviderCreators(batch: Creator[], data: SyncResponse) {
+  const results = new Map((data.results ?? []).map((result) => [result.creatorId, result]));
+  return batch.filter((creator) => {
+    const result = results.get(creator.id);
+    return result?.status === "error" && result.failureCode === "provider_unavailable";
+  });
+}
+
+function mergeProviderRetry(
+  original: SyncResponse,
+  retried: SyncResponse,
+  retriedCreators: Creator[],
+): SyncResponse {
+  const retriedIds = new Set(retriedCreators.map((creator) => creator.id));
+  const retriedResults = new Map((retried.results ?? []).map((result) => [result.creatorId, result]));
+  return {
+    ...original,
+    configured: original.configured ?? retried.configured,
+    syncedAt: original.syncedAt ?? retried.syncedAt,
+    videos: [
+      ...(original.videos ?? []).filter((video) => !retriedIds.has(video.creatorId ?? "")),
+      ...(retried.videos ?? []),
+    ],
+    results: (original.results ?? []).map((result) => (
+      retriedIds.has(result.creatorId ?? "")
+        ? retriedResults.get(result.creatorId) ?? result
+        : result
+    )),
+  };
+}
+
 async function requestSyncBatchOnce(
   batch: Creator[],
   signal: AbortSignal,
@@ -223,7 +303,7 @@ async function requestSyncBatchOnce(
     } catch {
       throw new Error(`同步服务返回异常（HTTP ${response.status}）`);
     }
-    if (!response.ok && !Array.isArray(data.results)) {
+    if (!response.ok && (!Array.isArray(data.results) || data.results.length === 0)) {
       throw new SyncHttpError(data.error || `同步服务返回 HTTP ${response.status}`, response.status);
     }
     return data;
@@ -245,9 +325,11 @@ export async function requestSyncBatch(
   existingVideos: VideoItem[] = [],
 ) {
   let lastError: unknown;
+  let data: SyncResponse | null = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      return await requestSyncBatchOnce(batch, signal, existingVideos);
+      data = await requestSyncBatchOnce(batch, signal, existingVideos);
+      break;
     } catch (error) {
       lastError = error;
       if (signal.aborted) throw createAbortError();
@@ -258,7 +340,18 @@ export async function requestSyncBatch(
       throw new Error(syncRequestError(lastError));
     }
   }
-  throw new Error(syncRequestError(lastError));
+  if (!data) throw new Error(syncRequestError(lastError));
+
+  const retryableCreators = getRetryableProviderCreators(batch, data);
+  if (!retryableCreators.length) return data;
+  await waitWithSignal(SYNC_RETRY_DELAY_MS, signal);
+  try {
+    const retried = await requestSyncBatchOnce(retryableCreators, signal, existingVideos);
+    return mergeProviderRetry(data, retried, retryableCreators);
+  } catch {
+    if (signal.aborted) throw createAbortError();
+    return data;
+  }
 }
 
 function asNonEmptyString(value: unknown) {

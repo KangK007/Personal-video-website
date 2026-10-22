@@ -57,6 +57,27 @@ describe("health route sidecar probe", () => {
     });
   });
 
+  it("does not report the sidecar healthy when the authenticated probe returns 5xx", async () => {
+    vi.stubEnv("FEED_SIDECAR_URL", "http://127.0.0.1:8001");
+    vi.stubEnv("FEED_SIDECAR_TOKEN", "matching-token");
+    let authProbe = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/openapi.json") return new Response("{}", { status: 200 });
+      authProbe += 1;
+      if (authProbe === 1) {
+        return new Response(null, { status: 401 });
+      }
+      return new Response(null, { status: 502 });
+    }));
+
+    await expect(health()).resolves.toMatchObject({
+      services: {
+        bilibili: { configured: true, healthy: false, message: "本机抓取服务返回 502" },
+      },
+    });
+  });
+
   it("reports a missing token without probing forever", async () => {
     vi.stubEnv("FEED_SIDECAR_URL", "http://127.0.0.1:8001");
     vi.stubEnv("FEED_SIDECAR_TOKEN", "");

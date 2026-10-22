@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const BASE_URL = process.argv[2] ?? process.env.E2E_BASE_URL ?? "http://127.0.0.1:3100";
+const PROFILE_DIR = path.join(process.cwd(), ".local", "e2e", "profile");
 const SHOT_DIR = path.join(process.cwd(), ".local", "e2e", "shots");
 
 const results = [];
@@ -95,6 +96,25 @@ function installSyncStub(context, state) {
         status: 502,
         contentType: "application/json",
         body: JSON.stringify({ error: "同步服务暂时不可用" }),
+      });
+      return;
+    }
+    if (state.syncMode === "restriction" && creators[0]?.platform === "bilibili") {
+      await route.fulfill({
+        status: 429,
+        contentType: "application/json",
+        body: JSON.stringify({
+          configured: true,
+          videos: [],
+          results: creators.map((creator) => ({
+            creatorId: creator.id,
+            status: "error",
+            count: 0,
+            complete: false,
+            message: "哔站访问受限，请稍后重试",
+            failureCode: "bilibili_rate_limited",
+          })),
+        }),
       });
       return;
     }
@@ -191,7 +211,11 @@ function installMetadataStub(context, state) {
 
 const state = { syncCalls: [], syncMode: "ok", metadataCalls: 0, metadataMode: "ok", videoSeed: 0, publishedOffsetMs: 0, syncDelayMs: 0, syncConfigured: true, syncErrorMessage: "" };
 
-const context = await chromium.launchPersistentContext(path.join(process.cwd(), ".local", "e2e", "profile"), {
+// The first journey must always start from a clean origin. Keeping the profile
+// directory between runs makes IndexedDB data from a failed run contaminate the
+// empty-state assertions on the next run.
+fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
+const context = await chromium.launchPersistentContext(PROFILE_DIR, {
   executablePath: browserExecutable(),
   headless: true,
   acceptDownloads: true,
@@ -271,6 +295,36 @@ try {
   await page.locator(".empty-state button", { hasText: "清除筛选" }).click();
   await page.waitForTimeout(250);
   check("清除筛选后恢复列表", (await page.locator(".video-card").count()) === 3);
+
+  // Platform links must use a user-gesture script navigation so FocusExtension's
+  // local trusted-origin exception can see the real initiator. Keep the href as
+  // a fallback, but verify the normal click path does not perform a raw anchor
+  // navigation that the extension can mistake for an external page.
+  section("平台外链 / FocusExtension 联动");
+  await page.evaluate(() => {
+    const calls = [];
+    Object.defineProperty(window, "__e2eOpenCalls", { configurable: true, value: calls });
+    Object.defineProperty(window, "__e2eOriginalOpen", { configurable: true, value: window.open });
+    window.open = ((url) => {
+      calls.push(String(url));
+      return window;
+    });
+  });
+  const platformLink = page.locator(".video-card").first().locator("a.cover-wrap");
+  const platformHref = await platformLink.getAttribute("href");
+  await platformLink.click();
+  const platformNavigation = await page.evaluate(() => ({
+    calls: window.__e2eOpenCalls ?? [],
+    currentUrl: window.location.href,
+  }));
+  check("平台视频点击使用脚本新窗口导航", platformNavigation.calls.length === 1 && platformNavigation.calls[0] === platformHref,
+    JSON.stringify(platformNavigation));
+  check("平台外链点击不会导航离开本站", platformNavigation.currentUrl.startsWith(BASE_URL), platformNavigation.currentUrl);
+  await page.evaluate(() => {
+    if (window.__e2eOriginalOpen) window.open = window.__e2eOriginalOpen;
+    delete window.__e2eOpenCalls;
+    delete window.__e2eOriginalOpen;
+  });
 
   await page.locator(".view-toggle button").nth(1).click();
   await page.waitForTimeout(200);
@@ -426,11 +480,45 @@ try {
   check("同步失败保留原有缓存", cardsAfterFailure === 4, `cards=${cardsAfterFailure}`);
   await shot(page, "03-sync-failed");
 
-  state.syncMode = "ok";
-  await page.locator(".sync-progress button", { hasText: "仅重试失败" }).click();
-  await waitSettled(page);
+  state.syncMode = "restriction";
+  await page.locator(".topbar-actions button", { hasText: "同步关注流" }).click();
+  await page.waitForFunction(() => document.querySelector(".sync-progress")?.textContent?.includes("本轮跳过 1"), null, { timeout: 30_000 });
+  const restrictedProgress = (await page.locator(".sync-progress").first().innerText()).replace(/\s+/g, " ");
+  check("限流后区分本轮失败与跳过", /本轮失败 1 · 本轮跳过 1/.test(restrictedProgress), restrictedProgress);
+  await page.locator('.main-nav a[href="/following"]').click();
+  const errorTab = page.locator(".status-tabs button", { hasText: "有错误" });
+  // Only the creator actually attempted and failed keeps an error; skipped creators
+  // clear their stale error instead of counting as new failures.
+  check("错误计数只反映本轮实际失败", (await errorTab.innerText()).includes("1"), await errorTab.innerText());
+  const bulkRetry = page.locator(".creator-list-page button", { hasText: "重试有错误的博主" });
+  check("提供批量重试有错误博主的入口", (await bulkRetry.count()) === 1 && (await bulkRetry.innerText()).includes("1"),
+    (await bulkRetry.count()) ? await bulkRetry.innerText() : "missing");
+  const followingProgress = page.locator(".sync-progress.is-compact");
+  check("切换页面后保留本轮同步进度", (await followingProgress.count()) === 1 && await followingProgress.isVisible(),
+    JSON.stringify(await followingProgress.boundingBox()));
+  const skippedRow = page.locator('.creator-list-card:has(a[href="https://space.bilibili.com/654321"])');
+  check("跳过博主说明本轮未请求且不再显示旧错误",
+    /本轮未请求（平台访问受限）/.test(await skippedRow.innerText()) && !/最近同步错误/.test(await skippedRow.innerText()),
+    await skippedRow.innerText());
+  await page.waitForTimeout(500);
+  await shot(page, "03b-sync-restricted-following");
   await page.waitForTimeout(600);
-  check("重试后恢复成功状态", /已同步|本地保存/.test(await statusText(page)), await statusText(page));
+  const restrictedStored = await readStoredState(page);
+  check("跳过的博主不再保留历史同步错误", restrictedStored.creators.filter((creator) => creator.syncError).length === 1,
+    `errors=${restrictedStored.creators.filter((creator) => creator.syncError).length}`);
+
+  state.syncMode = "ok";
+  await bulkRetry.click();
+  await page.waitForFunction(() => {
+    const tab = [...document.querySelectorAll(".status-tabs button")].find((button) => button.textContent?.includes("有错误"));
+    return tab ? /有错误\s*0/.test(tab.textContent ?? "") : false;
+  }, null, { timeout: 30_000 });
+  await waitSettled(page);
+  await page.waitForTimeout(400);
+  check("批量重试后恢复成功状态", /已同步|本地保存/.test(await statusText(page)), await statusText(page));
+  const errorTabAfterRetry = page.locator(".status-tabs button", { hasText: "有错误" });
+  check("批量重试后错误清零", (await errorTabAfterRetry.innerText()).includes("0"), await errorTabAfterRetry.innerText());
+  check("无错误时隐藏批量重试入口", (await page.locator(".creator-list-page button", { hasText: "重试有错误的博主" }).count()) === 0);
 
   // -------------------------------------------------------------- 备份/清空/导入
   section("备份导出 / 清空 / 导入");
@@ -470,10 +558,11 @@ try {
   const importedStored = await readStoredState(page);
   check("导入备份恢复全部数据", importedStored?.creators?.length === 3 && importedStored?.videos?.length === exported.videos.length,
     `creators=${importedStored?.creators?.length} videos=${importedStored?.videos?.length}`);
+  await page.locator('.main-nav a[href="/"]').click();
+  await page.waitForFunction(() => document.querySelectorAll(".video-card").length === 4, null, { timeout: 15_000 });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector(".app-shell");
-  await waitSettled(page);
-  await page.waitForTimeout(400);
+  await page.waitForFunction(() => document.querySelectorAll(".video-card").length === 4, null, { timeout: 15_000 });
   check("导入数据刷新后仍然存在", (await page.locator(".video-card").count()) === 4, `cards=${await page.locator(".video-card").count()}`);
 
   // ------------------------------------------------------------------ 个人页
@@ -519,8 +608,6 @@ try {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   check("移动端无横向溢出", overflow <= 1, `overflow=${overflow}px`);
   await shot(page, "05-mobile-home");
-
-  await context.close();
 
   // ------------------------------------------------- second, isolated origin
   section("残留旧版缓存 / 分享短链接 / 空态同步按钮");
@@ -650,6 +737,40 @@ try {
   } finally {
     await second.close();
   }
+
+  // Both tabs share one IndexedDB origin. Paused creators avoid an automatic
+  // sync racing with the data change that this cross-tab check observes.
+  section("多标签页状态同步");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(`${BASE_URL}/following`, { waitUntil: "domcontentloaded" });
+  await page.locator(".creator-list-card").first().waitFor({ timeout: 10_000 });
+  await page.waitForFunction(() => Array.from(document.querySelectorAll('.creator-list-actions button[aria-label^="取消关注"]')).every((button) => !button.disabled), null, { timeout: 30_000 });
+  const multiTabCreatorCount = await page.locator(".creator-list-card").count();
+  for (let index = 0; index < multiTabCreatorCount; index += 1) {
+    await page.locator(".creator-list-card").nth(index).getByRole("button", { name: "暂停", exact: true }).click();
+  }
+  await page.waitForTimeout(600);
+  const pausedState = await readStoredState(page);
+  check("多标签测试前关注名单已持久化为暂停", pausedState.creators.length === multiTabCreatorCount && pausedState.creators.every((creator) => !creator.enabled));
+
+  const otherTab = await context.newPage();
+  try {
+    await otherTab.goto(`${BASE_URL}/following`, { waitUntil: "domcontentloaded" });
+    await otherTab.waitForFunction((count) => document.querySelectorAll(".creator-list-card").length === count, multiTabCreatorCount, { timeout: 10_000 });
+    check("第二标签页读取同一份关注名单", (await otherTab.locator(".creator-list-card").count()) === multiTabCreatorCount);
+
+    await page.locator(".creator-list-card").first().locator('button[aria-label^="取消关注"]').click();
+    await page.getByRole("button", { name: "确认取消关注" }).click();
+    await otherTab.waitForFunction((count) => document.querySelectorAll(".creator-list-card").length === count - 1, multiTabCreatorCount, { timeout: 10_000 });
+    check("取消关注自动同步到第二标签页", (await otherTab.locator(".creator-list-card").count()) === multiTabCreatorCount - 1);
+
+    await page.locator(".notice-action", { hasText: "撤销" }).click();
+    await otherTab.waitForFunction((count) => document.querySelectorAll(".creator-list-card").length === count, multiTabCreatorCount, { timeout: 10_000 });
+    check("撤销后第二标签页也恢复关注", (await otherTab.locator(".creator-list-card").count()) === multiTabCreatorCount);
+  } finally {
+    await otherTab.close();
+  }
+  await context.close();
 } catch (error) {
   console.log("\n--- diagnostics ---");
   try {

@@ -9,6 +9,7 @@ import {
 import { LocalApiRequestError, readLocalJsonRequest } from "@/lib/local-api-request";
 import {
   getSidecarBaseUrl,
+  isRetryableSidecarError,
   probeSidecar,
   syncBilibiliCreator,
 } from "@/lib/server/bilibili-sync";
@@ -108,6 +109,18 @@ function getDouyinVideos(payload: unknown, creator: CreatorInput, syncedAt: stri
   });
 }
 
+function isRetryableBilibiliProviderFailure(error: unknown) {
+  if (isRetryableSidecarError(error) || isTransientRequestError(error)) return true;
+  return error instanceof Error
+    && /未启动或无法连接|抓取服务返回 (?:408|5\d\d)/i.test(error.message);
+}
+
+function isBilibiliRestrictionFailure(error: unknown) {
+  return error instanceof Error
+    && (/风控|限流|请求过于频繁|请求被拦截|(?:^|\s)-(?:352|412)(?:\s|$)/.test(error.message)
+      || ("status" in error && error.status === 429));
+}
+
 function getDouyinProfile(payload: unknown): CreatorProfile | undefined {
   const root = asRecord(unwrapPayload(payload));
   const list = (Array.isArray(root.aweme_list) ? root.aweme_list : []) as unknown[];
@@ -165,7 +178,7 @@ async function fetchDouyinWithRetry(
 
 async function syncCreator(
   baseUrl: string | null,
-  sidecarError: string | null,
+  sidecarError: Error | null,
   douyinBrowser: DouyinBrowserSession | null,
   douyinBrowserError: string | null,
   creator: CreatorInput,
@@ -174,7 +187,7 @@ async function syncCreator(
 ) {
   if (creator.platform === "bilibili") {
     if (!baseUrl) throw new Error("未配置哔站本机抓取服务");
-    if (sidecarError) throw new Error(sidecarError);
+    if (sidecarError) throw sidecarError;
     return syncBilibiliCreator(baseUrl, creator, syncedAt, signal);
   }
 
@@ -195,10 +208,10 @@ async function syncCreator(
 async function runSync(request: Request, creators: CreatorInput[]) {
   const baseUrl = getSidecarBaseUrl();
   const syncedAt = new Date().toISOString();
-  let sidecarError: string | null = null;
+  let sidecarError: Error | null = null;
   if (creators.some((creator) => creator.platform === "bilibili")) {
     if (!baseUrl) {
-      sidecarError = "未配置哔站本机抓取服务，请先运行 npm run start:local";
+      sidecarError = new Error("未配置哔站本机抓取服务，请先运行 npm run start:local");
     } else {
       try {
         await probeSidecar(baseUrl, request.signal);
@@ -206,7 +219,7 @@ async function runSync(request: Request, creators: CreatorInput[]) {
         if (request.signal.aborted) {
           return NextResponse.json({ error: "同步已取消" }, { status: 499 });
         }
-        sidecarError = error instanceof Error ? error.message : "哔站本机抓取服务不可用";
+        sidecarError = error instanceof Error ? error : new Error("哔站本机抓取服务不可用");
       }
     }
   }
@@ -226,6 +239,7 @@ async function runSync(request: Request, creators: CreatorInput[]) {
   const results: SyncResult[] = [];
   const videos: NormalizedVideo[] = [];
   let douyinCircuitOpen = false;
+  let bilibiliCircuitOpen = false;
   try {
     for (let index = 0; index < creators.length; index += 1) {
       const creator = creators[index];
@@ -239,6 +253,18 @@ async function runSync(request: Request, creators: CreatorInput[]) {
           mode: creator.knownVideoIds?.length ? "incremental" : "snapshot",
           failureCode: "douyin_circuit_open",
           message: "抖音连续返回异常数据，本轮已暂停后续抖音同步；请稍后再试",
+        });
+        continue;
+      }
+      if (creator.platform === "bilibili" && bilibiliCircuitOpen) {
+        results.push({
+          creatorId: creator.id,
+          status: "error",
+          count: 0,
+          complete: false,
+          mode: "snapshot",
+          failureCode: "bilibili_circuit_open",
+          message: "哔站触发访问限制，本轮已暂停后续哔站同步；请稍后再试",
         });
         continue;
       }
@@ -265,8 +291,14 @@ async function runSync(request: Request, creators: CreatorInput[]) {
         });
       } catch (error) {
         if (request.signal.aborted) break;
-        const failureCode = getDouyinFailureCode(error);
+        const failureCode = getDouyinFailureCode(error)
+          ?? (creator.platform === "bilibili" && isBilibiliRestrictionFailure(error)
+            ? "bilibili_rate_limited"
+            : creator.platform === "bilibili" && isRetryableBilibiliProviderFailure(error)
+              ? "provider_unavailable"
+              : undefined);
         if (failureCode === "douyin_circuit_open") douyinCircuitOpen = true;
+        if (failureCode === "bilibili_rate_limited") bilibiliCircuitOpen = true;
         results.push({
           creatorId: creator.id,
           status: "error",
