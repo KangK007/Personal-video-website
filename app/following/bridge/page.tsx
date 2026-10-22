@@ -2,7 +2,15 @@
 
 import { useEffect, useState } from "react";
 
-const BILIBILI_ORIGINS = new Set(["https://api.bilibili.com", "https://www.bilibili.com", "https://bilibili.com"]);
+const BILIBILI_HOST = /(^|\.)bilibili\.com$/i;
+
+function isBilibiliOrigin(origin: string) {
+  try {
+    return BILIBILI_HOST.test(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
 
 export default function FollowingBridgePage() {
   const [message, setMessage] = useState("等待哔站关注名单...");
@@ -16,7 +24,7 @@ export default function FollowingBridgePage() {
     }
     let receiving = false;
     const receive = async (event: MessageEvent) => {
-      if (receiving || event.source !== opener || !BILIBILI_ORIGINS.has(event.origin)
+      if (receiving || event.source !== opener || !isBilibiliOrigin(event.origin)
         || event.data?.type !== "following-list" || event.data?.token !== token) return;
       receiving = true;
       try {

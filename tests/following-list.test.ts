@@ -48,4 +48,17 @@ describe("following list format", () => {
     await readFollowingStream(new Response(body), (event) => events.push(event.type), new AbortController().signal);
     expect(events).toEqual(["page", "result", "done"]);
   });
+
+  it("reports a mid-line disconnect as an interrupted extraction, not a JSON error", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"type":"page","platform":"douyin","creators":[],"received":0,"total":'));
+        controller.close();
+      },
+    });
+
+    await expect(readFollowingStream(new Response(body), () => undefined, new AbortController().signal))
+      .rejects.toThrow("连接提前结束");
+  });
 });

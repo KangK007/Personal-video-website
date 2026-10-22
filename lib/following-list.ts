@@ -202,7 +202,18 @@ export async function readFollowingStream(response: Response, onEvent: (event: F
       }
       if (chunk.done) break;
     }
-    consume(buffer);
+    if (buffer.trim()) {
+      try {
+        consume(buffer);
+      } catch (error) {
+        // A stream cut in the middle of a line must read as "interrupted", not as a
+        // raw JSON parse error from the transport.
+        if (!done && error instanceof SyntaxError) {
+          throw new Error("连接提前结束，已获取的名单保留为未完整结果");
+        }
+        throw error;
+      }
+    }
     if (!done) throw new Error("连接提前结束，已获取的名单保留为未完整结果");
   } finally {
     signal.removeEventListener("abort", abort);

@@ -119,6 +119,26 @@ try {
     }
     console.log("PASS  JSON 名单导入追加新博主且保留已有昵称");
 
+    // A single-platform partial file only fills one progress entry; retrying the other
+    // platform used to crash the whole route (undefined progress).
+    const pageErrors = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    const partialImportFile = {
+      kind: "following-list", version: 1, exportedAt: new Date().toISOString(),
+      creators: [{ ...partialCreator, name: "部分博主" }],
+      platformResults: [{ platform: "bilibili", status: "partial", received: 1, total: 3, invalidCount: 2 }],
+    };
+    await page.locator(".following-collector input[type=file]").setInputFiles({
+      name: "following-list-partial.json", mimeType: "application/json",
+      buffer: Buffer.from(JSON.stringify(partialImportFile)),
+    });
+    await page.getByText("已载入名单文件，请检查并选择要追加的博主").waitFor();
+    await page.getByRole("button", { name: "重新提取" }).first().click();
+    await page.waitForTimeout(1_200);
+    if (pageErrors.length) throw new Error(`单平台部分名单重新提取崩溃：${pageErrors[0]}`);
+    if (!(await page.locator(".following-collector").count())) throw new Error("重新提取后提取窗口消失");
+    console.log("PASS  单平台部分名单导入后重新提取不崩溃");
+
     await page.waitForFunction(() => document.querySelector(".topbar-status")?.textContent?.includes("已同步"));
     const syncCountBeforeBackup = syncBatches.length;
     await page.getByRole("button", { name: "关闭窗口" }).click();
@@ -139,32 +159,42 @@ try {
     await context.close();
   }
 
-  for (const source of ["www", "api"]) {
+  for (const source of ["www", "api", "space"]) {
     const bridgeContext = await browser.newContext();
     try {
+      // Echo the caller origin so the same stub works for www / space cross-origin calls.
+      const corsFor = (request) => ({
+        "access-control-allow-origin": request.headers()["origin"] ?? "https://www.bilibili.com",
+        "access-control-allow-credentials": "true",
+      });
       await bridgeContext.route("https://www.bilibili.com/", (route) => route.fulfill({
         contentType: "text/html", body: "<!doctype html><title>哔哩哔哩</title>",
       }));
-      const corsHeaders = {
-        "access-control-allow-origin": "https://www.bilibili.com",
-        "access-control-allow-credentials": "true",
-      };
+      await bridgeContext.route("https://space.bilibili.com/**", (route) => route.fulfill({
+        contentType: "text/html", body: "<!doctype html><title>哔哩哔哩个人空间</title>",
+      }));
       await bridgeContext.route("https://api.bilibili.com/x/web-interface/nav", (route) => route.fulfill({
-        contentType: "application/json", headers: corsHeaders,
+        contentType: "application/json", headers: corsFor(route.request()),
         body: JSON.stringify({ code: 0, data: { isLogin: true, mid: 123, uname: "测试账号" } }),
       }));
       await bridgeContext.route("https://api.bilibili.com/x/relation/followings?**", (route) => route.fulfill({
-        contentType: "application/json", headers: corsHeaders,
+        contentType: "application/json", headers: corsFor(route.request()),
         body: JSON.stringify({ code: 0, data: { total: 1, list: [{ mid: 456, uname: "测试博主" }] } }),
       }));
 
+      const pageUrls = {
+        www: "https://www.bilibili.com/",
+        api: "https://api.bilibili.com/x/web-interface/nav",
+        // The following-list page itself, which the remediation message tells users to use.
+        space: "https://space.bilibili.com/123/relation/following",
+      };
       const appPage = await bridgeContext.newPage();
       await appPage.goto(`${baseUrl}/following`, { waitUntil: "domcontentloaded" });
       await appPage.getByRole("button", { name: "从平台提取" }).click();
       await appPage.getByRole("button", { name: "连接当前哔站页面" }).click();
       const script = await appPage.getByRole("textbox", { name: "哔站连接脚本" }).inputValue();
       const biliPage = await bridgeContext.newPage();
-      await biliPage.goto(source === "www" ? "https://www.bilibili.com/" : "https://api.bilibili.com/x/web-interface/nav", { waitUntil: "domcontentloaded" });
+      await biliPage.goto(pageUrls[source], { waitUntil: "domcontentloaded" });
       const popupPromise = biliPage.waitForEvent("popup", { timeout: 10_000 });
       const scriptRun = biliPage.evaluate(script);
       const receiver = await popupPromise;

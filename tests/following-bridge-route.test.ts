@@ -51,6 +51,25 @@ describe("following browser bridge routes", () => {
       headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "content-type": "application/json" },
       body: JSON.stringify({ token: session.token }),
     }));
-    expect(consumed.status).toBe(202);
+    expect(consumed.status).toBe(410);
+    expect(await consumed.json()).toMatchObject({ error: expect.stringContaining("已失效") });
+  });
+
+  it("distinguishes an unknown or expired session from a pending one", async () => {
+    const unknown = await resultPost(new Request("http://127.0.0.1:3000/api/following/bridge/result", {
+      method: "POST",
+      headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "content-type": "application/json" },
+      body: JSON.stringify({ token: "a".repeat(43) }),
+    }));
+    expect(unknown.status).toBe(410);
+
+    const sessionResponse = await sessionPost(localRequest({}));
+    const session = await sessionResponse.json() as { token: string };
+    const pending = await resultPost(new Request("http://127.0.0.1:3000/api/following/bridge/result", {
+      method: "POST",
+      headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "content-type": "application/json" },
+      body: JSON.stringify({ token: session.token }),
+    }));
+    expect(pending.status).toBe(202);
   });
 });

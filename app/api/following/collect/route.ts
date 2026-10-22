@@ -62,11 +62,20 @@ export async function POST(request: Request) {
         try {
           for (const platform of platforms) {
             const state = { received: 0, total: 0, invalidCount: 0 };
+            // A retry restarts the platform collector from page 1; accumulate the
+            // union so the reported count never regresses below what was streamed.
+            const seenIds = new Set<string>();
             const callbacks = {
               account: (source: "douyin" | "bilibili", account: { id: string; name: string }) => writeEvent(controller, { type: "account", platform: source, account }),
               page: (source: "douyin" | "bilibili", creators: unknown[], received: number, total: number, invalidCount: number) => {
-                state.received = received; state.total = total; state.invalidCount = invalidCount;
-                writeEvent(controller, { type: "page", platform: source, creators, received, total, invalidCount });
+                for (const creator of creators) {
+                  const id = (creator as { platformUserId?: unknown }).platformUserId;
+                  if (typeof id === "string" && id) seenIds.add(id);
+                }
+                state.received = Math.max(state.received, received, seenIds.size);
+                state.total = Math.max(state.total, total);
+                state.invalidCount = Math.max(state.invalidCount, invalidCount);
+                writeEvent(controller, { type: "page", platform: source, creators, received: state.received, total: state.total || total, invalidCount: state.invalidCount });
               },
             };
             try {
@@ -83,7 +92,13 @@ export async function POST(request: Request) {
                 }
               }
               if (!result) throw new Error("平台提取未返回结果");
-              const final: FollowingResult = { platform, status: "complete", received: result.received, total: result.total, invalidCount: result.invalidCount };
+              const final: FollowingResult = {
+                platform,
+                status: "complete",
+                received: Math.max(result.received, state.received),
+                total: Math.max(result.total, state.total),
+                invalidCount: Math.max(result.invalidCount, state.invalidCount),
+              };
               results.push(final); writeEvent(controller, { type: "result", result: final });
             } catch (error) {
               if (request.signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;

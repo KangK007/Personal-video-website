@@ -62,6 +62,16 @@ export function getFollowingBridgeSession(token: string) {
   return sessions().get(token);
 }
 
+export type FollowingBridgeStatus = "unknown" | "consumed" | "pending" | "ready";
+
+/** Distinguishes "not delivered yet" from "the session is gone" for the polling UI. */
+export function getFollowingBridgeStatus(token: string): FollowingBridgeStatus {
+  const session = getFollowingBridgeSession(token);
+  if (!session) return "unknown";
+  if (session.consumed) return "consumed";
+  return session.payload ? "ready" : "pending";
+}
+
 export function setFollowingBridgePayload(token: string, payload: FollowingBridgePayload) {
   const session = getFollowingBridgeSession(token);
   if (!session || session.consumed || session.payload) return false;

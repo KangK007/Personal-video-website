@@ -36,6 +36,14 @@ type Props = {
 const EMPTY_SELECTION = new Set<string>();
 type PlatformProgress = { received: number; total?: number; invalidCount: number };
 
+function emptyProgress(): Record<Platform, PlatformProgress> {
+  return { douyin: { received: 0, invalidCount: 0 }, bilibili: { received: 0, invalidCount: 0 } };
+}
+
+function progressFor(value: Record<Platform, PlatformProgress>, platform: Platform): PlatformProgress {
+  return value[platform] ?? { received: 0, invalidCount: 0 };
+}
+
 function download(name: string, content: string, type: string) {
   const link = document.createElement("a");
   const url = URL.createObjectURL(new Blob([content], { type }));
@@ -55,20 +63,26 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
   const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [message, setMessage] = useState("");
   const [bridgeScript, setBridgeScript] = useState("");
-  const [bridgeState, setBridgeState] = useState<"idle" | "waiting">("idle");
+  const [bridgeState, setBridgeState] = useState<"idle" | "connecting" | "waiting">("idle");
   const [progress, setProgress] = useState<Record<Platform, PlatformProgress>>({ douyin: { received: 0, invalidCount: 0 }, bilibili: { received: 0, invalidCount: 0 } });
   const controllerRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const creatorsRef = useRef(creators);
   const progressRef = useRef(progress);
   const bridgeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const bridgeControllerRef = useRef<AbortController | null>(null);
+  const bridgePollFailuresRef = useRef(0);
+  const mountedRef = useRef(true);
   creatorsRef.current = creators;
   progressRef.current = progress;
 
   useEffect(() => () => {
+    mountedRef.current = false;
     // Closing the dialog must stop an in-flight extraction (and the temporary
-    // browser it drives) instead of letting it keep running in the background.
+    // browser it drives) and any pending browser-bridge polling instead of letting
+    // them keep running in the background.
     controllerRef.current?.abort();
+    bridgeControllerRef.current?.abort();
     if (bridgeTimerRef.current) clearInterval(bridgeTimerRef.current);
   }, []);
 
@@ -91,7 +105,7 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
     creatorsRef.current = [];
     setCreators([]); setResults([]); setAccounts({}); setSelected(new Set()); setMessage("");
     setIncludePartial(false);
-    const initialProgress = { douyin: { received: 0, invalidCount: 0 }, bilibili: { received: 0, invalidCount: 0 } };
+    const initialProgress = emptyProgress();
     progressRef.current = initialProgress;
     setProgress(initialProgress);
   };
@@ -99,6 +113,11 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
   const collect = async (requestedPlatforms?: Platform[]) => {
     const chosen = requestedPlatforms ?? (Object.keys(platforms) as Platform[]).filter((platform) => platforms[platform]);
     if (!chosen.length || status === "loading") return;
+    if (bridgeState !== "idle") {
+      setMessage("浏览器连接尚未完成，请等待结果或先取消连接");
+      return;
+    }
+    const collectedResults: FollowingResult[] = [];
     if (requestedPlatforms) {
       setIncludePartial(false);
       const retained = creatorsRef.current.filter((creator) => !chosen.includes(creator.platform));
@@ -128,7 +147,17 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
       await readFollowingStream(response, (event) => {
         if (event.type === "account") setAccounts((current) => ({ ...current, [event.platform]: event.account.name }));
         if (event.type === "page") {
-          const nextProgress = { ...progressRef.current, [event.platform]: { received: event.received, total: event.total, invalidCount: event.invalidCount } };
+          const previous = progressFor(progressRef.current, event.platform);
+          const nextProgress = {
+            ...progressRef.current,
+            [event.platform]: {
+              // A retried platform can restart from page 1; never let the counter
+              // (or the later result) go backwards below what is already previewed.
+              received: Math.max(previous.received, event.received),
+              total: event.total,
+              invalidCount: Math.max(previous.invalidCount, event.invalidCount),
+            },
+          };
           progressRef.current = nextProgress;
           setProgress(nextProgress);
           const known = new Set(creatorsRef.current.map(followingKey));
@@ -142,6 +171,7 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
           setCreators(creatorsRef.current);
         }
         if (event.type === "result") {
+          collectedResults.push(event.result);
           setResults((current) => [...current.filter((item) => item.platform !== event.result.platform), event.result]);
           setSelected((current) => {
             const next = new Set(current);
@@ -153,17 +183,26 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
           });
         }
       }, controller.signal);
-      setStatus("done");
-      setMessage("提取完成，请检查并选择要追加的博主");
+      const allFailed = chosen.every((platform) => {
+        const result = collectedResults.find((item) => item.platform === platform);
+        return !result || result.status === "error";
+      });
+      if (allFailed) {
+        setStatus("error");
+        setMessage("提取失败：所选平台都没有返回名单。请检查 Cookie 是否有效、本机浏览器是否可用，或稍后重试");
+      } else {
+        setStatus("done");
+        setMessage("提取完成，请检查并选择要追加的博主");
+      }
     } catch (error) {
       setResults((current) => {
         const known = new Set(current.map((result) => result.platform));
         return [...current, ...chosen.filter((platform) => !known.has(platform)).map((platform) => ({
           platform,
-          status: controller.signal.aborted ? "cancelled" as const : progressRef.current[platform].received ? "partial" as const : "error" as const,
-          received: progressRef.current[platform].received,
-          ...(progressRef.current[platform].total === undefined ? {} : { total: progressRef.current[platform].total }),
-          invalidCount: progressRef.current[platform].invalidCount,
+          status: controller.signal.aborted ? "cancelled" as const : progressFor(progressRef.current, platform).received ? "partial" as const : "error" as const,
+          received: progressFor(progressRef.current, platform).received,
+          ...(progressFor(progressRef.current, platform).total === undefined ? {} : { total: progressFor(progressRef.current, platform).total }),
+          invalidCount: progressFor(progressRef.current, platform).invalidCount,
           message: controller.signal.aborted ? "提取已取消" : error instanceof Error ? error.message : "提取中断",
         }))];
       });
@@ -173,15 +212,27 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
   };
 
   const connectBilibiliPage = async () => {
-    if (status === "loading" || bridgeState === "waiting") return;
+    if (status === "loading" || bridgeState !== "idle") return;
+    setBridgeState("connecting");
+    const controller = new AbortController();
+    bridgeControllerRef.current = controller;
+    const stopBridge = () => {
+      if (bridgeTimerRef.current) clearInterval(bridgeTimerRef.current);
+      bridgeTimerRef.current = null;
+      bridgeControllerRef.current?.abort();
+      bridgeControllerRef.current = null;
+      setBridgeState("idle");
+    };
     try {
       const response = await fetch("/api/following/bridge/session", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: "{}",
+        signal: controller.signal,
       });
       const session = await response.json() as { token?: string; expiresAt?: number; error?: string };
       if (!response.ok || !session.token) throw new Error(session.error || "无法创建浏览器连接");
+      if (!mountedRef.current || controller.signal.aborted) return;
       const script = makeBilibiliBridgeScript(window.location.origin, session.token);
       setIncludePartial(false);
       setBridgeScript(script);
@@ -189,7 +240,9 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
       setMessage("连接脚本已生成。切到哔站页面的控制台粘贴并回车，完成后切回本站。");
       try { await navigator.clipboard?.writeText(script); } catch { /* The visible script remains available for manual copy. */ }
       if (bridgeTimerRef.current) clearInterval(bridgeTimerRef.current);
+      bridgePollFailuresRef.current = 0;
       bridgeTimerRef.current = setInterval(async () => {
+        if (!mountedRef.current || controller.signal.aborted) return;
         try {
           if (typeof session.expiresAt === "number" && Date.now() >= session.expiresAt) {
             throw new Error("浏览器连接已过期，请重新连接当前哔站页面");
@@ -198,20 +251,26 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ token: session.token }),
+            signal: controller.signal,
           });
-          if (resultResponse.status === 202) return;
-          const payload = await resultResponse.json() as {
+          if (resultResponse.status === 202) {
+            bridgePollFailuresRef.current = 0;
+            return;
+          }
+          const payload = await resultResponse.json().catch(() => ({})) as {
             account?: { id: string; name: string };
             creators?: FollowingCreator[];
             result?: FollowingResult;
             error?: string;
           };
+          if (resultResponse.status === 410) {
+            throw new Error(payload.error || "浏览器连接已失效，请重新连接当前哔站页面");
+          }
           if (!resultResponse.ok || !payload.result || !payload.creators || !payload.account) {
             throw new Error(payload.error || "浏览器连接返回的数据无效");
           }
-          if (bridgeTimerRef.current) clearInterval(bridgeTimerRef.current);
-          bridgeTimerRef.current = null;
-          setBridgeState("idle");
+          stopBridge();
+          if (!mountedRef.current) return;
           setCreators((current) => [...current.filter((creator) => creator.platform !== "bilibili"), ...payload.creators!]);
           setResults((current) => [...current.filter((result) => result.platform !== "bilibili"), payload.result!]);
           setAccounts((current) => ({ ...current, bilibili: payload.account!.name }));
@@ -224,14 +283,22 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
           setStatus("done");
           setMessage(payload.result.status === "complete" ? "已从当前哔站页面取得关注名单，请检查并选择要追加的博主" : "已取得哔站部分名单，请确认后再选择是否包含未完整结果");
         } catch (error) {
-          if (bridgeTimerRef.current) clearInterval(bridgeTimerRef.current);
-          bridgeTimerRef.current = null;
-          setBridgeState("idle");
+          if (!mountedRef.current || controller.signal.aborted) return;
+          const message = error instanceof Error ? error.message : "浏览器连接失败";
+          // A single transient poll failure must not throw away a payload the page
+          // may already have delivered; only fatal/expired states or 3 failures do.
+          const fatal = /已失效|已过期|数据无效/.test(message);
+          bridgePollFailuresRef.current += 1;
+          if (!fatal && bridgePollFailuresRef.current < 3) return;
+          stopBridge();
           setStatus("error");
-          setMessage(error instanceof Error ? error.message : "浏览器连接失败");
+          setMessage(message);
         }
       }, 1_000);
     } catch (error) {
+      if (controller.signal.aborted) return;
+      stopBridge();
+      if (!mountedRef.current) return;
       setStatus("error");
       setMessage(error instanceof Error ? error.message : "无法创建浏览器连接");
     }
@@ -246,7 +313,8 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
       setAccounts({});
       setIncludePartial(false);
       setSelected(new Set(parsed.creators.filter((creator) => parsed.platformResults.some((result) => result.platform === creator.platform && result.status === "complete") && !existingKeys.has(getFeedCreatorIdentityKey(creator.profileUrl, creator.platform))).map(followingKey)));
-      setProgress(Object.fromEntries(parsed.platformResults.map((result) => [result.platform, { received: result.received, total: result.total, invalidCount: result.invalidCount }])) as Record<Platform, PlatformProgress>);
+      const initialProgress = emptyProgress();
+      setProgress({ ...initialProgress, ...Object.fromEntries(parsed.platformResults.map((result) => [result.platform, { received: result.received, total: result.total, invalidCount: result.invalidCount }])) });
       setStatus("done"); setMessage("已载入名单文件，请检查并选择要追加的博主");
     } catch (error) { setStatus("error"); setMessage(error instanceof Error ? error.message : "名单文件无法读取"); }
   };
@@ -293,11 +361,11 @@ export function FollowingCollector({ close, existingCreators, onAdd }: Props) {
     <div className="collector-actions"><button className="primary-button" type="button" onClick={() => void collect()} disabled={status === "loading" || bridgeState === "waiting" || !Object.values(platforms).some(Boolean)}>{status === "loading" ? <CircleNotchIcon /> : <CloudArrowDown size={18} aria-hidden="true" />}{status === "loading" ? "提取中" : "开始提取"}</button>{status === "loading" ? <button className="secondary-button" type="button" onClick={() => controllerRef.current?.abort()}><StopCircle size={18} aria-hidden="true" />取消</button> : null}<button className="secondary-button" type="button" onClick={() => void connectBilibiliPage()} disabled={status === "loading" || bridgeState === "waiting"}><Copy size={18} aria-hidden="true" />连接当前哔站页面</button><button className="secondary-button" type="button" onClick={() => fileRef.current?.click()} disabled={status === "loading" || bridgeState === "waiting"}><FileArrowUp size={18} aria-hidden="true" />导入名单 JSON</button><input ref={fileRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importFile(file); }} /></div>
     {bridgeState === "waiting" ? <div className="collector-bridge" role="status"><strong>浏览器连接已等待</strong><p>1. 切换到已登录的哔站页面。2. 在控制台粘贴脚本并回车。3. 脚本完成后切回本站，结果会自动出现。</p><textarea readOnly value={bridgeScript} aria-label="哔站连接脚本" rows={4} /><div className="collector-actions"><button className="text-button" type="button" onClick={() => void navigator.clipboard?.writeText(bridgeScript)}><Copy size={16} aria-hidden="true" />再次复制连接脚本</button><button className="text-button" type="button" onClick={() => { if (bridgeTimerRef.current) clearInterval(bridgeTimerRef.current); bridgeTimerRef.current = null; setBridgeState("idle"); setBridgeScript(""); setMessage("已取消浏览器连接"); }}>取消连接</button></div></div> : null}
     {message ? <p className={`collector-message collector-message-${status === "error" ? "error" : "info"}`} role={status === "error" ? "alert" : "status"}><Warning size={16} aria-hidden="true" />{message}</p> : null}
-    {status === "loading" ? <div className="collector-progress" role="status" aria-live="polite">{(Object.keys(platforms) as Platform[]).filter((platform) => platforms[platform]).map((platform) => <span key={platform}>{platform === "douyin" ? "抖音" : "哔站"} {progress[platform].received}{progress[platform].total === undefined ? "" : ` / ${progress[platform].total}`}</span>)}</div> : null}
-    {results.length ? <div className="collector-summary">{results.map((result) => <span key={result.platform} className={`collector-result collector-result-${result.status}`}>{result.status === "complete" ? <CheckCircle size={16} aria-hidden="true" /> : <Warning size={16} aria-hidden="true" />}{result.platform === "douyin" ? "抖音" : "哔站"}：{result.status === "complete" ? `已获取 ${result.received} 位${result.invalidCount ? `，异常 ${result.invalidCount} 条` : ""}` : `${result.message || "结果不完整"}（已获取 ${result.received} 位，异常 ${result.invalidCount} 条）`}{result.status !== "complete" ? <button className="text-button" type="button" onClick={() => void collect([result.platform])} disabled={status === "loading"}><ArrowsClockwise size={16} aria-hidden="true" />重新提取</button> : null}</span>)}</div> : null}
+    {status === "loading" ? <div className="collector-progress" role="status" aria-live="polite">{(Object.keys(platforms) as Platform[]).filter((platform) => platforms[platform]).map((platform) => { const value = progressFor(progress, platform); return <span key={platform}>{platform === "douyin" ? "抖音" : "哔站"} {value.received}{value.total === undefined ? "" : ` / ${value.total}`}</span>; })}</div> : null}
+    {results.length ? <div className="collector-summary">{results.map((result) => <span key={result.platform} className={`collector-result collector-result-${result.status}`}>{result.status === "complete" ? <CheckCircle size={16} aria-hidden="true" /> : <Warning size={16} aria-hidden="true" />}{result.platform === "douyin" ? "抖音" : "哔站"}：{result.status === "complete" ? `已获取 ${result.received} 位${result.invalidCount ? `，异常 ${result.invalidCount} 条` : ""}` : `${result.message || "结果不完整"}（已获取 ${result.received} 位，异常 ${result.invalidCount} 条）`}{result.status !== "complete" ? <button className="text-button" type="button" onClick={() => void collect([result.platform])} disabled={status === "loading" || bridgeState === "waiting"}><ArrowsClockwise size={16} aria-hidden="true" />重新提取</button> : null}</span>)}</div> : null}
     {hasPartial ? <label className="collector-partial-toggle"><input type="checkbox" checked={includePartial} onChange={(event) => setIncludePartial(event.target.checked)} />包含未完整结果</label> : null}
     {creators.length ? <div className="collector-preview"><div className="collector-preview-header"><strong>预览名单（新增 {newCreators.length} 位，重复 {duplicateCount} 位，异常 {invalidCount} 条，已选 {selectedCount} 位）</strong><button className="text-button" type="button" onClick={() => setSelected(allSelected ? new Set() : new Set(selectable.map(followingKey)))}>{allSelected ? "取消全选" : "全选可提交"}</button></div><div className="collector-rows">{creators.map((creator) => { const isExisting = existingKeys.has(getFeedCreatorIdentityKey(creator.profileUrl, creator.platform)); const canSelect = !isExisting && (includePartial || results.find((result) => result.platform === creator.platform)?.status === "complete"); return <label className={`collector-row ${isExisting ? "is-existing" : ""}`} key={followingKey(creator)}><input type="checkbox" checked={selected.has(followingKey(creator))} disabled={!canSelect} onChange={(event) => setSelected((current) => { const next = new Set(current); if (event.target.checked) next.add(followingKey(creator)); else next.delete(followingKey(creator)); return next; })} /><span><strong>{creator.name}</strong><small>{creator.platform === "douyin" ? "抖音" : "哔站"} · {creator.profileUrl}{isExisting ? " · 已在本站" : ""}</small></span></label>; })}</div></div> : null}
-    <div className="collector-footer"><button className="secondary-button" type="button" onClick={() => void copyList()} disabled={!creators.length}><Copy size={18} aria-hidden="true" />复制名单</button><button className="secondary-button" type="button" onClick={() => exportFile("json")} disabled={!creators.length}><DownloadSimple size={18} aria-hidden="true" />导出 JSON</button><button className="secondary-button" type="button" onClick={() => exportFile("txt")} disabled={!creators.length}><DownloadSimple size={18} aria-hidden="true" />导出 TXT</button><button className="primary-button" type="button" onClick={addSelected} disabled={!selectedCount || status === "loading"}><Check size={18} aria-hidden="true" />追加到本站</button></div>
+    <div className="collector-footer"><button className="secondary-button" type="button" onClick={() => void copyList()} disabled={!creators.length || status === "loading"}><Copy size={18} aria-hidden="true" />复制名单</button><button className="secondary-button" type="button" onClick={() => exportFile("json")} disabled={!creators.length || status === "loading"}><DownloadSimple size={18} aria-hidden="true" />导出 JSON</button><button className="secondary-button" type="button" onClick={() => exportFile("txt")} disabled={!creators.length || status === "loading"}><DownloadSimple size={18} aria-hidden="true" />导出 TXT</button><button className="primary-button" type="button" onClick={addSelected} disabled={!selectedCount || status === "loading"}><Check size={18} aria-hidden="true" />追加到本站</button></div>
   </div>;
 }
 
