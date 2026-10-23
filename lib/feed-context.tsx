@@ -108,12 +108,20 @@ type BilibiliSessionProbe = {
  * only an explicit "logged-out" answer changes the run.
  */
 async function probeBilibiliSession(signal: AbortSignal): Promise<BilibiliSessionProbe | null> {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  // The probe must never wedge a sync run; a slow answer is treated as unavailable.
+  const timeout = setTimeout(() => controller.abort(), 45_000);
   try {
-    const response = await fetch("/api/bilibili/session", { method: "POST", signal });
+    const response = await fetch("/api/bilibili/session", { method: "POST", signal: controller.signal });
     if (!response.ok) return null;
     return await response.json() as BilibiliSessionProbe;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener("abort", onAbort);
   }
 }
 

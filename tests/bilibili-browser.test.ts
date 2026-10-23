@@ -18,6 +18,7 @@ vi.mock("server-only", () => ({}));
 vi.mock("node:fs", () => ({ promises: { stat: mocks.stat, readFile: mocks.readFile } }));
 vi.mock("playwright-core", () => ({ chromium: { launch: mocks.launch } }));
 vi.mock("@/lib/douyin-browser", () => ({
+  closeWithTimeout: async (target: { close: () => Promise<unknown> }) => { await target.close(); },
   createContext: mocks.createContext,
   resolveBrowserExecutable: mocks.resolveBrowserExecutable,
 }));

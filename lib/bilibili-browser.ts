@@ -11,14 +11,16 @@ import {
   validFollowingId,
   type FollowingCreator,
 } from "@/lib/following-list";
-import { createContext, resolveBrowserExecutable } from "@/lib/douyin-browser";
+import { createContext, closeWithTimeout, resolveBrowserExecutable } from "@/lib/douyin-browser";
 
 const PAGE_TIMEOUT_MS = 30_000;
+const NAV_PROBE_TIMEOUT_MS = 15_000;
 const MAX_COOKIE_BYTES = 64 * 1024;
 const PAGE_SIZE = 50;
 const MAX_PAGES = 1_000;
 const PAGE_DELAY_MS = 1_500;
 const RETRY_DELAYS_MS = [2_000, 5_000] as const;
+const PROBE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0";
 
 export type BilibiliFollowingPage = {
   creators: FollowingCreator[];
@@ -161,38 +163,50 @@ export function interpretBilibiliNav(nav: Record<string, unknown>): BilibiliSess
 }
 
 /**
- * Lightweight login probe used before a post sync: the saved Cookie is the only
- * credential the sidecar sends, and an expired one turns into a long series of
- * risk-control failures instead of an actionable message.
+ * Lightweight login probe used before a post sync. This deliberately uses a plain
+ * HTTP request with the saved cookie instead of launching a headless browser: the
+ * browser path is slower, leaves processes behind when Edge misbehaves, and the
+ * automation fingerprint makes Bilibili risk control more likely to invalidate the
+ * very session we are checking.
  */
 export async function checkBilibiliLogin(signal?: AbortSignal): Promise<BilibiliSessionState> {
   throwIfAborted(signal);
-  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
-  let page: Page | undefined;
-  const onAbort = () => { void page?.close().catch(() => undefined); };
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const timeout = setTimeout(() => controller.abort(), NAV_PROBE_TIMEOUT_MS);
   try {
-    const [executablePath, cookieHeader] = await Promise.all([resolveBrowserExecutable(), readCookieHeader()]);
-    browser = await chromium.launch({
-      executablePath,
-      headless: true,
-      args: ["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
+    let cookieHeader: string;
+    try {
+      cookieHeader = await readCookieHeader();
+    } catch (error) {
+      return { status: "unavailable", message: error instanceof Error ? error.message : "哔站 Cookie 读取失败" };
+    }
+    const response = await fetch("https://api.bilibili.com/x/web-interface/nav", {
+      headers: {
+        cookie: cookieHeader,
+        "user-agent": PROBE_USER_AGENT,
+        referer: "https://www.bilibili.com/",
+        accept: "application/json",
+      },
+      signal: controller.signal,
+      cache: "no-store",
     });
-    const context = await createContext(browser, executablePath, cookieHeader, ".bilibili.com");
-    page = await context.newPage();
-    signal?.addEventListener("abort", onAbort, { once: true });
-    throwIfAborted(signal);
-    const nav = await readNavPayload(page);
-    return interpretBilibiliNav(nav);
+    if (!response.ok) {
+      return { status: "unavailable", message: `哔站登录检查返回 HTTP ${response.status}` };
+    }
+    return interpretBilibiliNav(asRecord(await response.json()));
   } catch (error) {
     if (signal?.aborted) throw createAbortError();
     return {
       status: "unavailable",
-      message: error instanceof Error ? error.message : "无法检查哔站登录状态",
+      message: error instanceof Error && error.name === "AbortError"
+        ? "哔站登录检查超时，请稍后重试"
+        : error instanceof Error ? error.message : "无法检查哔站登录状态",
     };
   } finally {
+    clearTimeout(timeout);
     signal?.removeEventListener("abort", onAbort);
-    await page?.close().catch(() => undefined);
-    await browser?.close().catch(() => undefined);
   }
 }
 
@@ -299,7 +313,7 @@ export async function collectBilibiliFollowing(
     throw error;
   } finally {
     signal?.removeEventListener("abort", onAbort);
-    await context?.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    if (context) await closeWithTimeout(context);
+    await closeWithTimeout(browser);
   }
 }

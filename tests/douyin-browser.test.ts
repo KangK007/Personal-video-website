@@ -2,7 +2,23 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
-import { parseDouyinPostPayload } from "@/lib/douyin-browser";
+import { closeWithTimeout, parseDouyinPostPayload } from "@/lib/douyin-browser";
+
+describe("closeWithTimeout", () => {
+  it("stops waiting when the browser close hangs", async () => {
+    const startedAt = Date.now();
+    await closeWithTimeout({ close: () => new Promise(() => undefined) }, 100);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  it("propagates a normal close and swallows close errors", async () => {
+    const close = vi.fn(async () => undefined);
+    await closeWithTimeout({ close }, 1_000);
+    expect(close).toHaveBeenCalledOnce();
+    await expect(closeWithTimeout({ close: async () => { throw new Error("closed early"); } }, 1_000))
+      .resolves.toBeUndefined();
+  });
+});
 
 describe("parseDouyinPostPayload", () => {
   it("rejects an empty post list so it cannot replace a cached snapshot", () => {

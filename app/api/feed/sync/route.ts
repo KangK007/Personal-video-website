@@ -47,6 +47,10 @@ const MAX_KNOWN_VIDEO_IDS = 100;
 const DOUYIN_RETRY_DELAYS_MS = [15_000, 30_000] as const;
 const DOUYIN_CREATOR_COOLDOWN_MIN_MS = 8_000;
 const DOUYIN_CREATOR_COOLDOWN_RANGE_MS = 6_000;
+// Hard per-request deadline: individual browser/page operations have their own
+// timeouts, but this catches anything that still wedges so the lock is released and
+// the client gets an actionable answer instead of an endless "syncing" spinner.
+const MAX_SYNC_DURATION_MS = 8 * 60 * 1000;
 
 type SyncProcessState = typeof globalThis & {
   __justFollowFeedSyncRunning?: boolean;
@@ -216,7 +220,8 @@ async function syncCreator(
   } satisfies SyncedCreator;
 }
 
-async function runSync(request: Request, creators: CreatorInput[]) {
+async function runSync(request: Request, creators: CreatorInput[], signal: AbortSignal = request.signal) {
+  const startedAt = Date.now();
   const baseUrl = getSidecarBaseUrl();
   const syncedAt = new Date().toISOString();
   let sidecarError: Error | null = null;
@@ -225,9 +230,9 @@ async function runSync(request: Request, creators: CreatorInput[]) {
       sidecarError = new Error("未配置哔站本机抓取服务，请先运行 npm run start:local");
     } else {
       try {
-        await probeSidecar(baseUrl, request.signal);
+        await probeSidecar(baseUrl, signal);
       } catch (error) {
-        if (request.signal.aborted) {
+        if (signal.aborted) {
           return NextResponse.json({ error: "同步已取消" }, { status: 499 });
         }
         sidecarError = error instanceof Error ? error : new Error("哔站本机抓取服务不可用");
@@ -238,9 +243,9 @@ async function runSync(request: Request, creators: CreatorInput[]) {
   let douyinBrowserError: string | null = null;
   if (creators.some((creator) => creator.platform === "douyin")) {
     try {
-      douyinBrowser = await openDouyinBrowserSession(request.signal);
+      douyinBrowser = await openDouyinBrowserSession(signal);
     } catch (error) {
-      if (request.signal.aborted) {
+      if (signal.aborted) {
         return NextResponse.json({ error: "同步已取消" }, { status: 499 });
       }
       douyinBrowserError = error instanceof Error ? error.message : "抖音浏览器同步启动失败";
@@ -254,7 +259,7 @@ async function runSync(request: Request, creators: CreatorInput[]) {
   try {
     for (let index = 0; index < creators.length; index += 1) {
       const creator = creators[index];
-      if (request.signal.aborted) break;
+      if (signal.aborted) break;
       if (creator.platform === "douyin" && douyinCircuitOpen) {
         results.push({
           creatorId: creator.id,
@@ -287,7 +292,7 @@ async function runSync(request: Request, creators: CreatorInput[]) {
           douyinBrowserError,
           creator,
           syncedAt,
-          request.signal,
+          signal,
         );
         // Avoid the argument-spread limit: a single creator may legitimately return
         // up to MAX_BILIBILI_VIDEOS entries.
@@ -301,7 +306,7 @@ async function runSync(request: Request, creators: CreatorInput[]) {
           ...(synced.profile ? { profile: synced.profile } : {}),
         });
       } catch (error) {
-        if (request.signal.aborted) break;
+        if (signal.aborted) break;
         const failureCode = getDouyinFailureCode(error)
           ?? (creator.platform === "bilibili" && isBilibiliRestrictionFailure(error)
             ? "bilibili_rate_limited"
@@ -326,9 +331,9 @@ async function runSync(request: Request, creators: CreatorInput[]) {
         const delay = DOUYIN_CREATOR_COOLDOWN_MIN_MS
           + Math.floor(Math.random() * (DOUYIN_CREATOR_COOLDOWN_RANGE_MS + 1));
         try {
-          await waitWithSignal(delay, request.signal);
+          await waitWithSignal(delay, signal);
         } catch (error) {
-          if (!request.signal.aborted) throw error;
+          if (!signal.aborted) throw error;
           break;
         }
       }
@@ -341,13 +346,18 @@ async function runSync(request: Request, creators: CreatorInput[]) {
     }
   }
 
-  if (request.signal.aborted) {
+  if (signal.aborted) {
     return NextResponse.json({ error: "同步已取消" }, { status: 499 });
   }
 
   const hasSuccess = results.some((result) => result.status === "success");
   const needsDouyin = creators.some((creator) => creator.platform === "douyin");
   const needsBilibili = creators.some((creator) => creator.platform === "bilibili");
+  const failedResults = results.filter((result) => result.status !== "success");
+  console.log(`[sync] done creators=${creators.length} ok=${results.length - failedResults.length} failed=${failedResults.length} videos=${videos.length} elapsedMs=${Date.now() - startedAt}ms`);
+  for (const failed of failedResults.slice(0, 5)) {
+    console.warn(`[sync] failed ${failed.creatorId}: ${failed.message ?? failed.failureCode ?? "unknown"}`);
+  }
   return NextResponse.json({
     // "A provider is set up for what this request asks for", not "the provider is
     // healthy": unhealthy providers fail per creator with their own message.
@@ -430,9 +440,31 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "已有同步任务正在进行，请等待完成后重试" }, { status: 409 });
   }
 
+  const controller = new AbortController();
+  const onRequestAbort = () => controller.abort();
+  request.signal.addEventListener("abort", onRequestAbort, { once: true });
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<NextResponse>((resolve) => {
+    deadlineTimer = setTimeout(() => {
+      controller.abort();
+      resolve(NextResponse.json(
+        { error: "同步请求超过最长时限，已停止本轮；请稍后重试" },
+        { status: 504 },
+      ));
+    }, MAX_SYNC_DURATION_MS);
+  });
+  const work = runSync(request, creators, controller.signal).catch((error) => {
+    console.error("[sync] handler failed", error);
+    return NextResponse.json({ error: "同步服务处理失败，请稍后重试" }, { status: 500 });
+  });
+  console.log(`[sync] start creators=${creators.length} douyin=${creators.filter((creator) => creator.platform === "douyin").length} bilibili=${creators.filter((creator) => creator.platform === "bilibili").length}`);
   try {
-    return await runSync(request, creators);
+    const response = await Promise.race([work, deadline]);
+    if (response.status === 504) console.warn("[sync] request deadline reached");
+    return response;
   } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    request.signal.removeEventListener("abort", onRequestAbort);
     releaseSyncLock();
   }
 }

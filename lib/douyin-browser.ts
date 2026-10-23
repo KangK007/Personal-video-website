@@ -20,6 +20,19 @@ import {
 
 const PAGE_TIMEOUT_MS = 30_000;
 const MAX_COOKIE_BYTES = 64 * 1024;
+// Playwright's close() waits for the browser process to exit; an unresponsive Edge
+// can make it hang forever, which would keep the sync request (and its lock) alive.
+// Never wait longer than this for cleanup.
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+
+export async function closeWithTimeout(target: { close: () => Promise<unknown> }, timeoutMs = BROWSER_CLOSE_TIMEOUT_MS) {
+  const closing = target.close().catch(() => undefined);
+  await Promise.race([
+    closing,
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
 const POST_API_PATH = "/aweme/v1/web/aweme/post/";
 const PROFILE_SCROLL_SELECTOR = ".route-scroll-container";
 
@@ -309,7 +322,7 @@ export async function createContext(browser: Browser, executablePath: string, co
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     });
   } catch (error) {
-    await context.close().catch(() => undefined);
+    await closeWithTimeout(context);
     throw error;
   }
   return context;
@@ -472,16 +485,16 @@ export async function openDouyinBrowserSession(signal?: AbortSignal): Promise<Do
           return await fetchUserPosts(context, profileUrl, knownVideoIds, requestSignal);
         } finally {
           try {
-            await context.close();
+            await closeWithTimeout(context);
           } catch {
             // Cleanup must not replace the synchronization result.
           }
         }
       },
-      close: () => browser.close(),
+      close: () => closeWithTimeout(browser),
     };
   } catch (error) {
-    await browser.close();
+    await closeWithTimeout(browser);
     throw error;
   }
 }
@@ -617,7 +630,7 @@ export async function collectDouyinFollowing(
     return { received, total: expectedTotal ?? received, invalidCount };
   } finally {
     signal?.removeEventListener("abort", onAbort);
-    await context.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    await closeWithTimeout(context);
+    await closeWithTimeout(browser);
   }
 }

@@ -357,7 +357,10 @@ export function syncRequestError(error: unknown) {
 
 function isRetryableSyncRequestError(error: unknown) {
   if (isAbortError(error) || error instanceof SyncRequestTimeoutError) return false;
-  if (error instanceof SyncHttpError) return error.status === 408 || error.status === 429 || error.status >= 500;
+  if (error instanceof SyncHttpError) {
+    // 504 is our own server-side deadline; retrying immediately would just hang again.
+    return error.status !== 504 && (error.status === 408 || error.status === 429 || error.status >= 500);
+  }
   if (error instanceof TypeError) return true;
   return error instanceof Error && /HTTP (408|429|5\d\d)|返回异常|超时/.test(error.message);
 }

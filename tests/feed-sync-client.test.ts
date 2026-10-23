@@ -231,4 +231,17 @@ describe("requestSyncBatch retry policy", () => {
     expect(isSyncBusyError(error)).toBe(true);
     expect(isProviderFailureError(error)).toBe(false);
   });
+
+  it("does not immediately retry the server-side deadline answer", async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ error: "同步请求超过最长时限，已停止本轮；请稍后重试" }),
+      { status: 504, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await requestSyncBatch([creator], new AbortController().signal, []).catch((caught: unknown) => caught);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error).toMatchObject({ httpStatus: 504 });
+  });
 });
