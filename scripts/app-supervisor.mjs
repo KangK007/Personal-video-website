@@ -17,6 +17,13 @@ let worker = null;
 let restartTimer = null;
 let restartDelayMs = 500;
 let stopping = false;
+// A worker that never survives startup cannot be fixed by restarting it forever;
+// give up after a few rapid failures so the user sees one actionable error.
+const MAX_RAPID_FAILURES = Math.min(
+  Math.max(Number.parseInt(process.env.APP_SUPERVISOR_MAX_RAPID_FAILURES ?? "", 10) || 5, 1),
+  20,
+);
+let rapidFailures = 0;
 
 function launchWorker() {
   const startedAt = Date.now();
@@ -36,7 +43,19 @@ function launchWorker() {
     if (stopping) return;
 
     const lifetimeMs = Date.now() - startedAt;
-    restartDelayMs = lifetimeMs >= 30_000 ? 500 : Math.min(restartDelayMs * 2, 10_000);
+    if (lifetimeMs >= 30_000) {
+      rapidFailures = 0;
+      restartDelayMs = 500;
+    } else {
+      rapidFailures += 1;
+      if (rapidFailures >= MAX_RAPID_FAILURES) {
+        console.error(
+          `网站连续 ${MAX_RAPID_FAILURES} 次启动后立即退出，已停止自动重启。请查看 .local/runtime 下的日志并修复后运行 npm run start:local。`,
+        );
+        process.exit(1);
+      }
+      restartDelayMs = Math.min(restartDelayMs * 2, 10_000);
+    }
     console.error(
       `网站进程意外退出（${signal ? `signal ${signal}` : `code ${code ?? "unknown"}`}），将在 ${restartDelayMs} ms 后重启。`,
     );
