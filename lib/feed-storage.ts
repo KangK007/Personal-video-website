@@ -128,6 +128,12 @@ function migrateCreator(value: unknown, version: number): Creator | null {
     : name === fallbackName ? "fallback" : "manual";
   const avatarUrl = normalizeHttpUrl(item.avatarUrl);
   const lastSyncAt = validDateString(item.lastSyncAt);
+  const rawEmptySnapshotCount = item.emptySnapshotCount;
+  const emptySnapshotCount = typeof rawEmptySnapshotCount === "number"
+    && Number.isSafeInteger(rawEmptySnapshotCount)
+    && rawEmptySnapshotCount >= 0 && rawEmptySnapshotCount <= 10
+    ? rawEmptySnapshotCount
+    : undefined;
   return {
     id,
     platform: item.platform,
@@ -138,6 +144,7 @@ function migrateCreator(value: unknown, version: number): Creator | null {
     enabled: typeof item.enabled === "boolean" ? item.enabled : true,
     ...(lastSyncAt ? { lastSyncAt } : {}),
     ...(asBoundedString(item.syncError, MAX_FEED_SYNC_ERROR_LENGTH) ? { syncError: asBoundedString(item.syncError, MAX_FEED_SYNC_ERROR_LENGTH) } : {}),
+    ...(emptySnapshotCount ? { emptySnapshotCount } : {}),
   };
 }
 

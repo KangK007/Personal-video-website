@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyBilibiliRunLimit, buildSyncBatches, clearSyncErrors, computeSyncStatus, getBilibiliCooldownMs, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, MAX_BILIBILI_CREATORS_PER_RUN, mergeRestrictionRetry, mergeSyncResponse, RESTRICTION_RETRY_DELAY_MS, type SyncResponse } from "@/lib/feed-sync";
+import { applyBilibiliRunLimit, buildSyncBatches, clearSyncErrors, computeSyncStatus, getBilibiliCooldownMs, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, MAX_BILIBILI_CREATORS_PER_RUN, mergeRestrictionRetry, mergeSyncResponse, reconcileSyncBatch, RESTRICTION_RETRY_DELAY_MS, type SyncResponse } from "@/lib/feed-sync";
 import { MAX_FEED_NAME_LENGTH, MAX_FEED_TITLE_LENGTH, migrateFeedState } from "@/lib/feed-storage";
 import type { Creator, FeedState, VideoItem } from "@/lib/feed-types";
 
@@ -29,6 +29,81 @@ function merge(videos: VideoItem[], response: SyncResponse) {
   const state: FeedState = { version: 2, creators: [creator], videos };
   return mergeSyncResponse(state, [creator], response);
 }
+
+describe("reconcileSyncBatch", () => {
+  it("keeps only creators that still exist with the same platform", () => {
+    const batch: Creator[] = [
+      creator,
+      { ...creator, id: "removed", name: "Removed" },
+      { ...creator, id: "changed-platform" },
+    ];
+    const current: Creator[] = [
+      { ...creator, enabled: false },
+      { ...creator, id: "changed-platform", platform: "douyin", profileUrl: "https://www.douyin.com/user/x" },
+    ];
+
+    const { active, removed } = reconcileSyncBatch(batch, current);
+
+    expect(active.map((item) => item.id)).toEqual(["creator-1"]);
+    expect(active[0].enabled).toBe(false);
+    expect(removed.map((item) => item.id)).toEqual(["removed", "changed-platform"]);
+  });
+});
+
+describe("mergeSyncResponse empty snapshot guard", () => {
+  const emptyResponse: SyncResponse = {
+    syncedAt: "2026-10-23T00:00:00.000Z",
+    videos: [],
+    results: [{ creatorId: creator.id, status: "success", complete: true, count: 0 }],
+  };
+
+  it("keeps cached videos on the first empty snapshot and asks for one confirmation", () => {
+    const first = merge([syncedVideo()], emptyResponse);
+
+    expect(first.videos.map((item) => item.videoUrl)).toEqual(["https://www.bilibili.com/video/BV1old411c7mD"]);
+    expect(first.failedCreatorIds).toEqual([creator.id]);
+    expect(first.creators[0]).toMatchObject({
+      emptySnapshotCount: 1,
+      syncError: expect.stringContaining("保留旧缓存"),
+    });
+  });
+
+  it("clears cached videos on the second consecutive empty snapshot", () => {
+    const first = merge([syncedVideo()], emptyResponse);
+    const state: FeedState = { version: 2, creators: first.creators, videos: first.videos };
+    const second = mergeSyncResponse(state, [first.creators[0]], emptyResponse);
+
+    expect(second.videos).toEqual([]);
+    expect(second.failedCreatorIds).toEqual([]);
+    expect(second.creators[0].emptySnapshotCount).toBeUndefined();
+    expect(second.creators[0].syncError).toBeUndefined();
+  });
+
+  it("accepts an empty snapshot when the creator has no cached feed-sync videos", () => {
+    const result = merge([], emptyResponse);
+
+    expect(result.failedCreatorIds).toEqual([]);
+    expect(result.videos).toEqual([]);
+  });
+
+  it("resets the guard after a non-empty snapshot", () => {
+    const first = merge([syncedVideo()], emptyResponse);
+    const incoming = syncedVideo({ id: "new-id", videoUrl: "https://www.bilibili.com/video/BV1new411c7mD" });
+    const recovered: FeedState = {
+      version: 2,
+      creators: first.creators,
+      videos: first.videos,
+    };
+    const result = mergeSyncResponse(recovered, [first.creators[0]], {
+      syncedAt: "2026-10-23T01:00:00.000Z",
+      videos: [incoming],
+      results: [{ creatorId: creator.id, status: "success", complete: true, count: 1 }],
+    });
+
+    expect(result.creators[0].emptySnapshotCount).toBeUndefined();
+    expect(result.creators[0].syncError).toBeUndefined();
+  });
+});
 
 describe("mergeSyncResponse", () => {
   it("replaces an old automatic snapshot only after a complete, count-matched result", () => {

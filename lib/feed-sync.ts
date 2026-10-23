@@ -432,10 +432,10 @@ export async function requestSyncBatch(
         await waitWithSignal(SYNC_RETRY_DELAY_MS, signal);
         continue;
       }
-      throw new Error(syncRequestError(lastError));
+      throw withProviderFailureFlag(new Error(syncRequestError(lastError)), lastError);
     }
   }
-  if (!data) throw new Error(syncRequestError(lastError));
+  if (!data) throw withProviderFailureFlag(new Error(syncRequestError(lastError)), lastError);
 
   const retryableCreators = getRetryableProviderCreators(batch, data);
   if (!retryableCreators.length) return data;
@@ -447,6 +447,46 @@ export async function requestSyncBatch(
     if (signal.aborted) throw createAbortError();
     return data;
   }
+}
+
+/**
+ * Narrows a sync batch to creators that still exist locally with the same platform.
+ * Records changed by the user during a run are reported as removed instead of
+ * aborting the whole run, so the remaining batches can still make progress.
+ */
+export function reconcileSyncBatch(batch: Creator[], currentCreators: Creator[]) {
+  const live = new Map(currentCreators.map((creator) => [creator.id, creator]));
+  const active: Creator[] = [];
+  const removed: Creator[] = [];
+  for (const creator of batch) {
+    const current = live.get(creator.id);
+    if (current && current.platform === creator.platform) active.push(current);
+    else removed.push(creator);
+  }
+  return { active, removed };
+}
+
+/**
+ * True when an error means the sync provider is unreachable/unstable (network,
+ * timeout, 5xx/408/429). Local configuration or contract errors are not provider
+ * failures and must not trip the provider circuit breaker.
+ */
+export function isProviderFailureError(error: unknown): boolean {
+  if (error instanceof SyncRequestTimeoutError) return true;
+  if (error instanceof SyncHttpError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  if (error instanceof TypeError) return true;
+  return Boolean((error as { providerFailure?: unknown } | null)?.providerFailure);
+}
+
+/** Tags a wrapped error with the provider-failure classification it was built from. */
+function withProviderFailureFlag(error: Error, source: unknown) {
+  Object.defineProperty(error, "providerFailure", {
+    value: isProviderFailureError(source),
+    enumerable: false,
+  });
+  return error;
 }
 
 function asNonEmptyString(value: unknown) {
@@ -558,6 +598,23 @@ export function mergeSyncResponse(
       ? [result.creatorId]
       : [];
   }));
+  // A "complete" empty snapshot can also be a disguised failure (risk control or an
+  // API shape change). Do not wipe a creator's cached videos on the first empty
+  // answer; require one more consecutive empty snapshot to confirm it.
+  const creatorsById = new Map(state.creators.map((creator) => [creator.id, creator]));
+  const cachedCreatorIds = new Set(
+    state.videos.filter((video) => video.source === "feed-sync").map((video) => video.creatorId),
+  );
+  const emptySnapshotDeferrals = new Map<string, string>();
+  for (const creatorId of [...completeIds]) {
+    if ((incomingByCreator.get(creatorId) ?? []).length > 0) continue;
+    const creator = creatorsById.get(creatorId);
+    if (!creator || !cachedCreatorIds.has(creatorId)) continue;
+    if ((creator.emptySnapshotCount ?? 0) < 1) {
+      completeIds.delete(creatorId);
+      emptySnapshotDeferrals.set(creatorId, "平台返回 0 条投稿，已保留旧缓存；再次同步确认后将清空");
+    }
+  }
   const incoming = candidateVideos.filter((video) => completeIds.has(video.creatorId));
   const snapshotIds = new Set(results.flatMap((result) => (
     typeof result.creatorId === "string"
@@ -598,6 +655,14 @@ export function mergeSyncResponse(
   const creators = state.creators.map((creator) => {
     const result = resultMap.get(creator.id);
     if (!result) return creator;
+    const deferredMessage = emptySnapshotDeferrals.get(creator.id);
+    if (deferredMessage) {
+      return {
+        ...creator,
+        syncError: deferredMessage,
+        emptySnapshotCount: Math.min((creator.emptySnapshotCount ?? 0) + 1, 10),
+      };
+    }
     if (!completeIds.has(creator.id)) {
       return {
         ...creator,
@@ -615,6 +680,8 @@ export function mergeSyncResponse(
       ...(avatarUrl ? { avatarUrl } : {}),
       lastSyncAt: syncedAt,
       syncError: undefined,
+      // A confirmed (second consecutive) or non-empty snapshot resets the guard.
+      emptySnapshotCount: undefined,
     };
   });
 

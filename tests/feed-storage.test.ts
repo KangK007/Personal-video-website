@@ -39,6 +39,25 @@ function manualVideo(id: string, videoUrl: string, platform: "bilibili" | "douyi
 }
 
 describe("feed storage migration", () => {
+  it("preserves a valid empty-snapshot guard and drops invalid values", () => {
+    const migrated = migrateFeedState({
+      version: 2,
+      creators: [{ ...creator, emptySnapshotCount: 1 }],
+      videos: [],
+    });
+
+    expect(migrated?.creators[0].emptySnapshotCount).toBe(1);
+
+    for (const invalid of [-1, 2.5, 99, "2"]) {
+      const dropped = migrateFeedState({
+        version: 2,
+        creators: [{ ...creator, emptySnapshotCount: invalid }],
+        videos: [],
+      });
+      expect(dropped?.creators[0].emptySnapshotCount).toBeUndefined();
+    }
+  });
+
   it("rejects Bilibili profile aliases that identify the same UID", () => {
     const state = {
       version: 2,

@@ -29,10 +29,12 @@ import {
   getBilibiliCooldownMs,
   getDouyinCooldownMs,
   getRestrictedSyncPlatform,
+  isProviderFailureError,
   isProviderUnavailableFailure,
   MAX_BILIBILI_CREATORS_PER_RUN,
   MAX_CONSECUTIVE_PROVIDER_FAILURES,
   requestSyncBatch,
+  reconcileSyncBatch,
   RESTRICTION_RETRY_DELAY_MS,
   syncRequestError,
   waitWithSignal,
@@ -146,6 +148,9 @@ export function FeedProvider({ children }: { children: ReactNode }) {
   const creatorsRef = useRef<Creator[]>([]);
   const videosRef = useRef<VideoItem[]>([]);
   const dataEpochRef = useRef(0);
+  // Bumped only by replaceState (import / clear). Regular edits (add, pause,
+  // unfollow, delete) must not abort a running sync, so they only bump dataEpoch.
+  const dataReplaceEpochRef = useRef(0);
   const persistVersionRef = useRef(0);
   const persistedVersionRef = useRef(0);
   const storageRevisionRef = useRef(0);
@@ -207,6 +212,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
 
   const replaceState = useCallback((next: FeedState) => {
     dataEpochRef.current += 1;
+    dataReplaceEpochRef.current += 1;
     autoSyncSeenIdsRef.current = new Set(next.creators.map((creator) => creator.id));
     pendingAutoSyncIdsRef.current.clear();
     creatorsRef.current = next.creators;
@@ -438,7 +444,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       syncingRef.current = true;
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
-      const epochAtStart = dataEpochRef.current;
+      const replaceEpochAtStart = dataReplaceEpochRef.current;
       const controller = new AbortController();
       abortRef.current = controller;
       failedIdsRef.current = [];
@@ -507,9 +513,10 @@ export function FeedProvider({ children }: { children: ReactNode }) {
             publish({ status: "error", message: "同步已取消；已有缓存已保留", currentStart: 0, currentEnd: 0 });
             return false;
           }
-          // The probe can take seconds; local edits during it invalidate the plan.
-          if (runIdRef.current !== runId || dataEpochRef.current !== epochAtStart) {
-            publish({ status: "error", message: "数据在同步期间发生变化，已停止本轮同步", currentStart: 0, currentEnd: 0 });
+          // Replacing the whole dataset (import/clear) invalidates this run; ordinary
+          // edits during the probe are reconciled per batch instead of aborting.
+          if (runIdRef.current !== runId || dataReplaceEpochRef.current !== replaceEpochAtStart) {
+            publish({ status: "error", message: "本地数据已被替换，已停止本轮同步", currentStart: 0, currentEnd: 0 });
             return false;
           }
           if (session?.status === "logged-out") {
@@ -520,28 +527,40 @@ export function FeedProvider({ children }: { children: ReactNode }) {
 
         const batches = buildSyncBatches(planned);
         for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-          const batch = batches[batchIndex];
-          if (blockedPlatforms.has(batch[0].platform)) {
+          const plannedBatch = batches[batchIndex];
+          if (blockedPlatforms.has(plannedBatch[0].platform)) {
             // Cookie is known to be invalid: skip without requesting and without
             // keeping stale risk-control errors on these records.
-            skipped += batch.length;
-            blockedSkipped += batch.length;
-            processed += batch.length;
-            skippedCreatorIds.push(...batch.map((creator) => creator.id));
-            clearErrorsFor(batch.map((creator) => creator.id));
+            skipped += plannedBatch.length;
+            blockedSkipped += plannedBatch.length;
+            processed += plannedBatch.length;
+            skippedCreatorIds.push(...plannedBatch.map((creator) => creator.id));
+            clearErrorsFor(plannedBatch.map((creator) => creator.id));
             publish({ message: "哔站 Cookie 已失效，本轮跳过哔站博主；更新 Cookie 后需要重启网站", skippedCreatorIds: [...skippedCreatorIds] });
             continue;
           }
-          if (restrictedPlatforms.has(batch[0].platform)) {
-            skipped += batch.length;
-            processed += batch.length;
-            skippedCreatorIds.push(...batch.map((creator) => creator.id));
+          if (restrictedPlatforms.has(plannedBatch[0].platform)) {
+            skipped += plannedBatch.length;
+            processed += plannedBatch.length;
+            skippedCreatorIds.push(...plannedBatch.map((creator) => creator.id));
             // A skipped creator was not attempted in this run, so an error from an
             // earlier run must not keep counting as a current failure.
-            clearErrorsFor(batch.map((creator) => creator.id));
-            publish({ message: `本轮已跳过访问受限的${batch[0].platform === "douyin" ? "抖音" : "哔站"}博主`, skippedCreatorIds: [...skippedCreatorIds] });
+            clearErrorsFor(plannedBatch.map((creator) => creator.id));
+            publish({ message: `本轮已跳过访问受限的${plannedBatch[0].platform === "douyin" ? "抖音" : "哔站"}博主`, skippedCreatorIds: [...skippedCreatorIds] });
             continue;
           }
+          // The user may pause/unfollow/remove records while this run is walking the
+          // plan. Apply results only to records that still exist; never abort the run
+          // for a normal edit (only import/clear replaces the dataset).
+          const initial = reconcileSyncBatch(plannedBatch, creatorsRef.current);
+          if (initial.removed.length) {
+            skipped += initial.removed.length;
+            processed += initial.removed.length;
+            skippedCreatorIds.push(...initial.removed.map((creator) => creator.id));
+            publish({ message: `同步期间有 ${initial.removed.length} 位博主被修改，已跳过`, skippedCreatorIds: [...skippedCreatorIds] });
+          }
+          if (!initial.active.length) continue;
+          const batch = initial.active;
           const batchStart = processed + 1;
           const batchEnd = processed + batch.length;
           const currentNames = batch.slice(0, 2).map((creator) => creator.name).join("、");
@@ -571,7 +590,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
               restrictionRetried.add(initialRestricted);
               publish({ message: `${initialRestricted === "douyin" ? "抖音" : "哔站"}访问受限，等待 ${Math.round(RESTRICTION_RETRY_DELAY_MS / 1_000)} 秒后重试一次` });
               await waitWithSignal(RESTRICTION_RETRY_DELAY_MS, controller.signal);
-              if (runIdRef.current !== runId || dataEpochRef.current !== epochAtStart) {
+              if (runIdRef.current !== runId || dataReplaceEpochRef.current !== replaceEpochAtStart) {
                 interrupted = true;
                 break;
               }
@@ -583,22 +602,34 @@ export function FeedProvider({ children }: { children: ReactNode }) {
               break;
             }
             const message = syncRequestError(error);
-            if (dataEpochRef.current === epochAtStart && runIdRef.current === runId) {
-              const marked = markBatchFailed({ creators: creatorsRef.current, videos: videosRef.current }, batch, message);
+            const failedBatch = reconcileSyncBatch(batch, creatorsRef.current);
+            const removedNow = failedBatch.removed.length;
+            if (removedNow) {
+              skipped += removedNow;
+              processed += removedNow;
+              skippedCreatorIds.push(...failedBatch.removed.map((creator) => creator.id));
+            }
+            if (failedBatch.active.length) {
+              const marked = markBatchFailed({ creators: creatorsRef.current, videos: videosRef.current }, failedBatch.active, message);
               creatorsRef.current = marked.creators;
               setCreatorsState(marked.creators);
               stateChanged = true;
+              failed += failedBatch.active.length;
+              processed += failedBatch.active.length;
+              failedIdsRef.current = Array.from(new Set([...failedIdsRef.current, ...failedBatch.active.map((creator) => creator.id)]));
             }
-            failed += batch.length;
-            processed += batch.length;
-            failedIdsRef.current = Array.from(new Set([...failedIdsRef.current, ...batch.map((creator) => creator.id)]));
-            consecutiveProviderFailures += 1;
-            if (consecutiveProviderFailures >= MAX_CONSECUTIVE_PROVIDER_FAILURES) {
-              // The provider is down: do not label every remaining creator as failed.
-              providerInterrupted = true;
-              interrupted = true;
-              publish({ message: `同步服务连续 ${consecutiveProviderFailures} 次请求失败，已停止本轮同步；剩余博主未标记为失败，可直接重试` });
-              break;
+            const providerFailure = isProviderFailureError(error);
+            if (providerFailure) {
+              consecutiveProviderFailures += 1;
+              if (consecutiveProviderFailures >= MAX_CONSECUTIVE_PROVIDER_FAILURES) {
+                // The provider is down: do not label every remaining creator as failed.
+                providerInterrupted = true;
+                interrupted = true;
+                publish({ message: `同步服务连续 ${consecutiveProviderFailures} 次请求失败，已停止本轮同步；剩余博主未标记为失败，可直接重试` });
+                break;
+              }
+            } else {
+              consecutiveProviderFailures = 0;
             }
             publish({ message: `第 ${batchStart}-${batchEnd} 位同步失败，继续处理后续博主` });
             if (hasAnotherDouyinBatch) {
@@ -609,12 +640,21 @@ export function FeedProvider({ children }: { children: ReactNode }) {
             continue;
           }
 
-          if (controller.signal.aborted || runIdRef.current !== runId || dataEpochRef.current !== epochAtStart) {
+          if (controller.signal.aborted || runIdRef.current !== runId || dataReplaceEpochRef.current !== replaceEpochAtStart) {
             interrupted = true;
             break;
           }
+          // Reconcile again: records can be paused/removed while the request ran.
+          const current = reconcileSyncBatch(batch, creatorsRef.current);
+          if (current.removed.length) {
+            skipped += current.removed.length;
+            processed += current.removed.length;
+            skippedCreatorIds.push(...current.removed.map((creator) => creator.id));
+          }
+          if (!current.active.length) continue;
+          const applyBatch = current.active;
 
-          const merged = mergeSyncResponse({ creators: creatorsRef.current, videos: videosRef.current }, batch, data);
+          const merged = mergeSyncResponse({ creators: creatorsRef.current, videos: videosRef.current }, applyBatch, data);
           creatorsRef.current = merged.creators;
           videosRef.current = merged.videos;
           setCreatorsState(merged.creators);
@@ -622,11 +662,11 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           stateChanged = true;
           const batchFailed = merged.failedCreatorIds.length;
           failed += batchFailed;
-          succeeded += batch.length - batchFailed;
-          processed += batch.length;
+          succeeded += applyBatch.length - batchFailed;
+          processed += applyBatch.length;
           incomingCount += merged.incomingCount;
           failedIdsRef.current = Array.from(new Set([...failedIdsRef.current, ...merged.failedCreatorIds]));
-          const restrictedPlatform = getRestrictedSyncPlatform(batch, data);
+          const restrictedPlatform = getRestrictedSyncPlatform(applyBatch, data);
           if (restrictedPlatform) restrictedPlatforms.add(restrictedPlatform);
           if (isProviderUnavailableFailure(data)) {
             consecutiveProviderFailures += 1;
@@ -657,7 +697,9 @@ export function FeedProvider({ children }: { children: ReactNode }) {
             ? `同步服务连续 ${consecutiveProviderFailures} 次失败或不稳定，已停止本轮同步；未处理的博主可直接重试`
             : controller.signal.aborted
               ? "同步已取消；已有缓存已保留"
-              : "数据在同步期间发生变化，已停止应用后续结果";
+              : dataReplaceEpochRef.current !== replaceEpochAtStart
+                ? "本地数据已被替换，已停止应用后续结果"
+                : "数据在同步期间发生变化，已停止应用后续结果";
           const status: SyncStatus = succeeded > 0 && processed > 0 ? "partial" : "error";
           publish({
             status,
@@ -764,7 +806,13 @@ export function FeedProvider({ children }: { children: ReactNode }) {
     if (!targets.length) {
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
-      setSyncProgress({ ...EMPTY_PROGRESS, status: "success", message: "当前没有同步失败的博主", runId });
+      // Do not report success for a no-op: the reported failures are paused/removed.
+      setSyncProgress({
+        ...EMPTY_PROGRESS,
+        status: "partial",
+        message: "没有可重试的博主（报错的博主已暂停或已取消关注）",
+        runId,
+      });
       return Promise.resolve(false);
     }
     return syncFeed(targets);

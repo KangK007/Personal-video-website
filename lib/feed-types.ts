@@ -12,6 +12,8 @@ export type Creator = {
   enabled: boolean;
   lastSyncAt?: string;
   syncError?: string;
+  /** Consecutive empty-but-complete snapshots; the second one clears cached videos. */
+  emptySnapshotCount?: number;
 };
 
 export type VideoSource = "public-metadata" | "manual" | "sample" | "feed-sync";

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { requestSyncBatch, SYNC_REQUEST_TIMEOUT_MS, SYNC_RETRY_DELAY_MS } from "@/lib/feed-sync";
+import { isProviderFailureError, requestSyncBatch, SYNC_REQUEST_TIMEOUT_MS, SYNC_RETRY_DELAY_MS } from "@/lib/feed-sync";
 import type { Creator } from "@/lib/feed-types";
 
 const creator: Creator = {
@@ -190,5 +190,31 @@ describe("requestSyncBatch retry policy", () => {
       ],
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies server and network failures as provider failures", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ error: "暂时不可用" }),
+      { status: 503, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = requestSyncBatch([creator], new AbortController().signal, []).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(SYNC_RETRY_DELAY_MS + 10);
+    expect(isProviderFailureError(await pending)).toBe(true);
+  });
+
+  it("does not classify local contract errors as provider failures", async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ error: "请求格式不正确" }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await requestSyncBatch([creator], new AbortController().signal, []).catch((caught: unknown) => caught);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isProviderFailureError(error)).toBe(false);
   });
 });
