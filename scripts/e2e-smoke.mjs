@@ -299,6 +299,10 @@ try {
   await search.fill("抖音测试博主");
   await page.waitForTimeout(250);
   check("搜索按标题/博主过滤", (await page.locator(".video-card").count()) === 1, `cards=${await page.locator(".video-card").count()}`);
+  const searchedPlatformTabs = (await page.locator(".platform-tabs button").allInnerTexts()).map((text) => text.replace(/\s+/g, " "));
+  check("平台标签计数随搜索条件更新",
+    searchedPlatformTabs[0].includes(" 1") && searchedPlatformTabs[1].includes(" 1") && searchedPlatformTabs[2].includes(" 0"),
+    searchedPlatformTabs.join(" | "));
   await search.fill("不存在的关键词");
   await page.waitForTimeout(250);
   await page.getByRole("heading", { name: "没有匹配结果" }).waitFor({ timeout: 5000 });
@@ -407,6 +411,9 @@ try {
   section("关注列表：筛选 / 暂停 / 重试");
   await page.locator('.main-nav a[href="/following"]').click();
   await page.waitForSelector(".creator-list-card", { timeout: 10_000 });
+  // Let any auto-sync finish: a snapshot update can reorder the list by latest video.
+  await waitSettled(page);
+  await page.waitForTimeout(300);
   check("关注列表显示 3 位博主", (await page.locator(".creator-list-card").count()) === 3);
 
   await page.locator(".status-tabs button", { hasText: "全部" }).click();
@@ -417,21 +424,31 @@ try {
   await page.waitForTimeout(250);
 
   const firstCard = page.locator(".creator-list-card").first();
+  const pausedCreatorName = (await firstCard.locator("strong").first().innerText()).trim();
   await firstCard.getByRole("button", { name: "暂停" }).click();
   await page.waitForTimeout(400);
-  check("暂停后卡片标记为已暂停", (await firstCard.locator(".status-badge.is-paused").count()) === 1);
+  const pausedCard = page.locator(".creator-list-card").filter({ has: page.locator(".status-badge.is-paused") }).first();
+  check("暂停后卡片标记为已暂停", (await pausedCard.count()) === 1, `paused=${pausedCreatorName}`);
   await page.locator(".status-tabs button", { hasText: "已暂停" }).click();
   await page.waitForTimeout(300);
   check("已暂停筛选只显示暂停博主", (await page.locator(".creator-list-card").count()) === 1, `cards=${await page.locator(".creator-list-card").count()}`);
+  const pausedIsBilibili = (await pausedCard.innerText()).includes("哔站");
+  const pausedPlatformTabs = (await page.locator(".platform-tabs button").allInnerTexts()).map((text) => text.replace(/\s+/g, " "));
+  check("平台标签计数随状态筛选更新",
+    pausedPlatformTabs[0].includes(" 1")
+      && (pausedIsBilibili ? pausedPlatformTabs[2].includes(" 1") && pausedPlatformTabs[1].includes(" 0")
+        : pausedPlatformTabs[1].includes(" 1") && pausedPlatformTabs[2].includes(" 0")),
+    `paused=${pausedIsBilibili ? "bilibili" : "douyin"} | ${pausedPlatformTabs.join(" | ")}`);
   await page.locator(".status-tabs button", { hasText: "全部" }).click();
   await page.waitForTimeout(300);
 
-  await firstCard.getByRole("button", { name: "恢复" }).click();
+  const restoredCard = page.locator(".creator-list-card").filter({ hasText: pausedCreatorName }).first();
+  await restoredCard.getByRole("button", { name: "恢复" }).click();
   await page.waitForTimeout(400);
-  check("恢复后可再次同步", (await firstCard.getByRole("button", { name: "暂停" }).count()) === 1);
+  check("恢复后可再次同步", (await restoredCard.getByRole("button", { name: "暂停" }).count()) === 1);
 
   const beforeSync = state.syncCalls.length;
-  await firstCard.getByRole("button", { name: "重试" }).click();
+  await restoredCard.getByRole("button", { name: "重试" }).click();
   await page.waitForTimeout(900);
   check("单博主重试触发同步请求", state.syncCalls.length > beforeSync, `before=${beforeSync} after=${state.syncCalls.length}`);
   await waitSettled(page);
@@ -477,6 +494,33 @@ try {
   } else {
     check("可删除视频显示删除按钮", false, "no .card-delete found");
   }
+
+  // -------------------------------------------------- 撤销提示保留
+  section("撤销提示不被后续操作清除");
+  const videosBeforeRetention = await page.locator(".video-card").count();
+  await page.locator(".card-delete").first().click();
+  await page.locator(".notice-text").filter({ hasText: "已移除本地保存的视频" }).waitFor({ timeout: 10_000 });
+  await page.waitForTimeout(300);
+  await page.locator('.main-nav a[href="/following"]').click();
+  await page.waitForSelector(".creator-list-card");
+  await page.locator(".creator-list-card").first().locator('button[aria-label^="取消关注"]').click();
+  await page.getByRole("button", { name: "确认取消关注" }).click();
+  await page.waitForTimeout(400);
+  check("取消关注不会清掉上一条撤销提示",
+    (await page.locator(".notice-text").first().innerText()).includes("已移除本地保存的视频"),
+    await page.locator(".notice-text").first().innerText());
+  await page.locator(".notice-action", { hasText: "撤销" }).click();
+  await page.locator(".notice-text").filter({ hasText: "已取消关注" }).waitFor({ timeout: 10_000 });
+  await page.waitForTimeout(400);
+  await page.locator(".notice-action", { hasText: "撤销" }).click();
+  await page.waitForTimeout(700);
+  await waitSettled(page);
+  check("排队的取消关注撤销仍可恢复博主", (await page.locator(".creator-list-card").count()) === 3,
+    `cards=${await page.locator(".creator-list-card").count()}`);
+  await page.locator('.main-nav a[href="/"]').click();
+  await page.waitForTimeout(500);
+  check("视频撤销恢复卡片", (await page.locator(".video-card").count()) === videosBeforeRetention,
+    `cards=${await page.locator(".video-card").count()} expected=${videosBeforeRetention}`);
 
   // ------------------------------------------------------------ 同步失败恢复
   section("同步失败与重试");
@@ -544,6 +588,27 @@ try {
   const errorTabAfterRetry = page.locator(".status-tabs button", { hasText: "有错误" });
   check("批量重试后错误清零", (await errorTabAfterRetry.innerText()).includes("0"), await errorTabAfterRetry.innerText());
   check("无错误时隐藏批量重试入口", (await page.locator(".creator-list-page button", { hasText: "重试有错误的博主" }).count()) === 0);
+
+  // -------------------------------------------------- 同步期间编辑
+  section("同步期间编辑不中止其余批次");
+  await page.locator('.main-nav a[href="/"]').click();
+  await page.waitForSelector(".video-card", { timeout: 10_000 });
+  state.syncDelayMs = 700;
+  await page.locator(".topbar-actions button", { hasText: "同步关注流" }).click();
+  await page.waitForTimeout(500);
+  await page.locator('.main-nav a[href="/following"]').click();
+  await page.waitForSelector(".creator-list-card", { timeout: 10_000 });
+  await page.locator(".creator-list-page button", { hasText: "暂停" }).first().click();
+  await page.waitForTimeout(300);
+  await waitSettled(page);
+  await page.waitForTimeout(500);
+  const editedRunProgress = (await page.locator(".sync-progress").first().innerText()).replace(/\s+/g, " ");
+  check("同步期间编辑不会中止本次同步",
+    !editedRunProgress.includes("数据在同步期间发生变化") && /已同步|部分完成|本地保存/.test(await statusText(page)),
+    editedRunProgress);
+  state.syncDelayMs = 0;
+  await page.locator(".creator-list-page button", { hasText: "恢复" }).first().click();
+  await page.waitForTimeout(400);
 
   // -------------------------------------------------------------- 备份/清空/导入
   section("备份导出 / 清空 / 导入");
