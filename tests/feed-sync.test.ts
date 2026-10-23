@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyBilibiliRunLimit, buildSyncBatches, clearSyncErrors, computeSyncStatus, getBilibiliCooldownMs, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, MAX_BILIBILI_CREATORS_PER_RUN, mergeRestrictionRetry, mergeSyncResponse, reconcileSyncBatch, RESTRICTION_RETRY_DELAY_MS, type SyncResponse } from "@/lib/feed-sync";
+import { applyBilibiliRunLimit, AUTO_SYNC_CONTINUE_DELAY_MS, buildSyncBatches, clearSyncErrors, computeSyncStatus, getBilibiliCooldownMs, getDouyinCooldownMs, getKnownDouyinVideoIdsForSync, getRestrictedSyncPlatform, isProviderUnavailableFailure, MAX_AUTO_SYNC_ROUNDS, MAX_BILIBILI_CREATORS_PER_RUN, mergeRestrictionRetry, mergeSyncResponse, reconcileSyncBatch, RESTRICTION_RETRY_DELAY_MS, shouldAutoContinueSync, type SyncResponse } from "@/lib/feed-sync";
 import { MAX_FEED_NAME_LENGTH, MAX_FEED_TITLE_LENGTH, migrateFeedState } from "@/lib/feed-storage";
 import type { Creator, FeedState, VideoItem } from "@/lib/feed-types";
 
@@ -131,6 +131,39 @@ describe("mergeSyncResponse empty snapshot guard", () => {
 
     expect(result.creators[0].emptySnapshotCount).toBeUndefined();
     expect(result.creators[0].syncError).toBeUndefined();
+  });
+});
+
+describe("shouldAutoContinueSync", () => {
+  const clean = {
+    round: 1,
+    maxRounds: MAX_AUTO_SYNC_ROUNDS,
+    deferred: 155,
+    failed: 0,
+    emptySkipped: 0,
+    bilibiliBlocked: false,
+    restricted: 0,
+    aborted: false,
+    runValid: true,
+  };
+
+  it("continues a clean slice while deferred creators remain", () => {
+    expect(shouldAutoContinueSync(clean)).toBe(true);
+    expect(MAX_AUTO_SYNC_ROUNDS).toBeGreaterThan(1);
+    expect(AUTO_SYNC_CONTINUE_DELAY_MS).toBeGreaterThanOrEqual(5_000);
+  });
+
+  it.each([
+    ["a failure", { failed: 1 }],
+    ["an empty-result signal", { emptySkipped: 2 }],
+    ["a blocked Bilibili session", { bilibiliBlocked: true }],
+    ["a restricted platform", { restricted: 1 }],
+    ["an aborted run", { aborted: true }],
+    ["an invalidated run", { runValid: false }],
+    ["no deferred creators", { deferred: 0 }],
+    ["the last allowed round", { round: MAX_AUTO_SYNC_ROUNDS }],
+  ])("stops on %s", (_label, patch) => {
+    expect(shouldAutoContinueSync({ ...clean, ...patch })).toBe(false);
   });
 });
 

@@ -80,6 +80,36 @@ export const SYNC_RETRY_DELAY_MS = 1_200;
 export const RESTRICTION_RETRY_DELAY_MS = 20_000;
 /** Bilibili is paced much slower, so one run only covers a slice of the list. */
 export const MAX_BILIBILI_CREATORS_PER_RUN = 50;
+/** Maximum number of chained slices one clicked sync may run automatically. */
+export const MAX_AUTO_SYNC_ROUNDS = 10;
+/** Breather between automatically continued slices. */
+export const AUTO_SYNC_CONTINUE_DELAY_MS = 15_000;
+
+/**
+ * Decides whether a clean slice should be followed by another slice automatically.
+ * Any failure, empty-result signal or platform restriction stops the chain so a bad
+ * platform day cannot turn into a long unattended loop.
+ */
+export function shouldAutoContinueSync(input: {
+  round: number;
+  maxRounds: number;
+  deferred: number;
+  failed: number;
+  emptySkipped: number;
+  bilibiliBlocked: boolean;
+  restricted: number;
+  aborted: boolean;
+  runValid: boolean;
+}): boolean {
+  return input.runValid
+    && !input.aborted
+    && input.round < input.maxRounds
+    && input.deferred > 0
+    && input.failed === 0
+    && input.emptySkipped === 0
+    && !input.bilibiliBlocked
+    && input.restricted === 0;
+}
 const DOUYIN_COOLDOWN_MIN_MS = 8_000;
 const DOUYIN_COOLDOWN_RANGE_MS = 6_000;
 const BILIBILI_COOLDOWN_MIN_MS = 3_000;

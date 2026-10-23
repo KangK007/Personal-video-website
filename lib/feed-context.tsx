@@ -34,8 +34,11 @@ import {
   isSyncBusyError,
   MAX_BILIBILI_CREATORS_PER_RUN,
   MAX_CONSECUTIVE_PROVIDER_FAILURES,
+  MAX_AUTO_SYNC_ROUNDS,
+  AUTO_SYNC_CONTINUE_DELAY_MS,
   requestSyncBatch,
   reconcileSyncBatch,
+  shouldAutoContinueSync,
   RESTRICTION_RETRY_DELAY_MS,
   syncRequestError,
   waitWithSignal,
@@ -449,10 +452,14 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       const controller = new AbortController();
       abortRef.current = controller;
       failedIdsRef.current = [];
-      // Bilibili is paced slowly, so one run covers a slice of its list; the rest is
-      // reported as deferred and picked up by the next run.
-      const { planned, deferred } = applyBilibiliRunLimit(targets);
-      const deferredCount = deferred.length;
+
+      // Bilibili is paced slowly, so one run covers a slice of its list. When a slice
+      // finishes cleanly the run automatically continues with the next slice, so a
+      // large following list can be synced with one click instead of one click per slice.
+      let round = 0;
+      let planned: Creator[] = [];
+      let deferred: Creator[] = [];
+      let deferredCount = 0;
       let processed = 0;
       let succeeded = 0;
       let failed = 0;
@@ -460,15 +467,26 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       let blockedSkipped = 0;
       let emptySnapshotSkipped = 0;
       let incomingCount = 0;
-      const blockedPlatforms = new Set<Creator["platform"]>();
-      const restrictionRetried = new Set<Creator["platform"]>();
-      const skippedCreatorIds: string[] = [];
-      const restrictedPlatforms = new Set<Creator["platform"]>();
+      let blockedPlatforms = new Set<Creator["platform"]>();
+      let restrictionRetried = new Set<Creator["platform"]>();
+      let skippedCreatorIds: string[] = [];
+      let restrictedPlatforms = new Set<Creator["platform"]>();
       let interrupted = false;
       let stateChanged = false;
       let consecutiveProviderFailures = 0;
       let providerInterrupted = false;
       let busyInterrupted = false;
+      let bilibiliSessionBlocked = false;
+      let sessionChecked = false;
+      let cumulativeProcessed = 0;
+      let cumulativePlanned = 0;
+      let cumulativeSucceeded = 0;
+      let cumulativeFailed = 0;
+      let cumulativeSkipped = 0;
+      let cumulativeBlockedSkipped = 0;
+      let cumulativeEmptySkipped = 0;
+      let cumulativeIncoming = 0;
+      let roundAccumulated = false;
 
       const applyCreators = (next: Creator[]) => {
         creatorsRef.current = next;
@@ -487,44 +505,78 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           ...current,
           ...patch,
           status: patch.status ?? "loading",
-          total: planned.length,
-          processed,
-          succeeded,
-          failed,
-          skipped,
+          total: cumulativePlanned + (roundAccumulated ? 0 : planned.length),
+          processed: cumulativeProcessed + (roundAccumulated ? 0 : processed),
+          succeeded: cumulativeSucceeded + (roundAccumulated ? 0 : succeeded),
+          failed: cumulativeFailed + (roundAccumulated ? 0 : failed),
+          skipped: cumulativeSkipped + (roundAccumulated ? 0 : skipped),
           deferred: deferredCount,
           runId,
         }));
       };
 
-      publish({
-        status: "loading",
-        message: `准备同步 ${planned.length} 位博主`,
-        failedCreatorIds: [],
-        skippedCreatorIds: [],
-        restrictedPlatforms: [],
-      });
+      const beginRound = (nextPlanned: Creator[], nextDeferred: Creator[]) => {
+        round += 1;
+        planned = nextPlanned;
+        deferred = nextDeferred;
+        deferredCount = deferred.length;
+        processed = 0;
+        succeeded = 0;
+        failed = 0;
+        skipped = 0;
+        blockedSkipped = 0;
+        emptySnapshotSkipped = 0;
+        incomingCount = 0;
+        blockedPlatforms = new Set();
+        restrictionRetried = new Set();
+        skippedCreatorIds = [];
+        restrictedPlatforms = new Set();
+        interrupted = false;
+        providerInterrupted = false;
+        busyInterrupted = false;
+        consecutiveProviderFailures = 0;
+        failedIdsRef.current = [];
+        roundAccumulated = false;
+      };
 
       try {
+        while (true) {
+          const roundTargets = round === 0 ? targets : deferred;
+          if (!roundTargets.length) break;
+          const limited = applyBilibiliRunLimit(roundTargets);
+          beginRound(limited.planned, limited.deferred);
+          publish({
+            status: "loading",
+            message: round === 1 ? `准备同步 ${planned.length} 位博主` : `第 ${round} 轮：继续同步剩余 ${planned.length} 位博主`,
+            failedCreatorIds: [],
+            skippedCreatorIds: [],
+            restrictedPlatforms: [],
+          });
         // The sidecar only has the saved cookie; warn before it degrades into a long
-        // series of risk-control failures.
+        // series of risk-control failures. The probe runs once per sync, not per round.
         if (planned.some((creator) => creator.platform === "bilibili")) {
-          publish({ status: "loading", message: "正在检查哔站登录状态" });
-          const session = await probeBilibiliSession(controller.signal);
-          if (controller.signal.aborted) {
-            interrupted = true;
-            publish({ status: "error", message: "同步已取消；已有缓存已保留", currentStart: 0, currentEnd: 0 });
-            return false;
-          }
-          // Replacing the whole dataset (import/clear) invalidates this run; ordinary
-          // edits during the probe are reconciled per batch instead of aborting.
-          if (runIdRef.current !== runId || dataReplaceEpochRef.current !== replaceEpochAtStart) {
-            publish({ status: "error", message: "本地数据已被替换，已停止本轮同步", currentStart: 0, currentEnd: 0 });
-            return false;
-          }
-          if (session?.status === "logged-out") {
+          if (!sessionChecked) {
+            sessionChecked = true;
+            publish({ status: "loading", message: "正在检查哔站登录状态" });
+            const session = await probeBilibiliSession(controller.signal);
+            if (controller.signal.aborted) {
+              interrupted = true;
+              publish({ status: "error", message: "同步已取消；已有缓存已保留", currentStart: 0, currentEnd: 0 });
+              return false;
+            }
+            // Replacing the whole dataset (import/clear) invalidates this run; ordinary
+            // edits during the probe are reconciled per batch instead of aborting.
+            if (runIdRef.current !== runId || dataReplaceEpochRef.current !== replaceEpochAtStart) {
+              publish({ status: "error", message: "本地数据已被替换，已停止本轮同步", currentStart: 0, currentEnd: 0 });
+              return false;
+            }
+            if (session?.status === "logged-out") {
+              bilibiliSessionBlocked = true;
+              blockedPlatforms.add("bilibili");
+              publish({ message: "哔站 Cookie 已失效，本轮跳过哔站博主；更新 Cookie 后需要重启网站" });
+            }
+          } else if (bilibiliSessionBlocked) {
             blockedPlatforms.add("bilibili");
-            publish({ message: "哔站 Cookie 已失效，本轮跳过哔站博主；更新 Cookie 后需要重启网站" });
           }
         }
 
@@ -724,7 +776,9 @@ export function FeedProvider({ children }: { children: ReactNode }) {
                 : dataReplaceEpochRef.current !== replaceEpochAtStart
                   ? "本地数据已被替换，已停止应用后续结果"
                   : "数据在同步期间发生变化，已停止应用后续结果";
-          const status: SyncStatus = succeeded > 0 && processed > 0 ? "partial" : "error";
+          const status: SyncStatus = cumulativeSucceeded + succeeded > 0 && cumulativeProcessed + processed > 0
+            ? "partial"
+            : "error";
           publish({
             status,
             message,
@@ -737,27 +791,77 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           return false;
         }
 
-        const bilibiliBlocked = blockedPlatforms.has("bilibili");
-        const restrictionSkipped = skipped - blockedSkipped - emptySnapshotSkipped;
-        const status = computeSyncStatus({ failed, succeeded, skipped, deferred: deferredCount });
+        cumulativeProcessed += processed;
+        cumulativePlanned += planned.length;
+        cumulativeSucceeded += succeeded;
+        cumulativeFailed += failed;
+        cumulativeSkipped += skipped;
+        cumulativeBlockedSkipped += blockedSkipped;
+        cumulativeEmptySkipped += emptySnapshotSkipped;
+        cumulativeIncoming += incomingCount;
+        roundAccumulated = true;
+
+        const runValid = !controller.signal.aborted
+          && runIdRef.current === runId
+          && dataReplaceEpochRef.current === replaceEpochAtStart;
+        if (shouldAutoContinueSync({
+          round,
+          maxRounds: MAX_AUTO_SYNC_ROUNDS,
+          deferred: deferredCount,
+          failed: cumulativeFailed,
+          emptySkipped: cumulativeEmptySkipped,
+          bilibiliBlocked: bilibiliSessionBlocked,
+          restricted: restrictedPlatforms.size,
+          aborted: controller.signal.aborted,
+          runValid,
+        })) {
+          publish({
+            status: "loading",
+            message: `第 ${round} 轮完成；${Math.round(AUTO_SYNC_CONTINUE_DELAY_MS / 1_000)} 秒后自动继续剩余 ${deferredCount} 位哔站博主（第 ${round + 1} 轮）`,
+            currentStart: 0,
+            currentEnd: 0,
+            failedCreatorIds: [],
+            skippedCreatorIds: [],
+          });
+          try {
+            await waitWithSignal(AUTO_SYNC_CONTINUE_DELAY_MS, controller.signal);
+          } catch {
+            publish({ status: "error", message: "同步已取消；已有缓存已保留", currentStart: 0, currentEnd: 0 });
+            return false;
+          }
+          if (!runValid || runIdRef.current !== runId) {
+            publish({ status: "error", message: "同步已停止；已有缓存已保留", currentStart: 0, currentEnd: 0 });
+            return false;
+          }
+          continue;
+        }
+
+        const restrictionSkipped = cumulativeSkipped - cumulativeBlockedSkipped - cumulativeEmptySkipped;
+        const status = computeSyncStatus({
+          failed: cumulativeFailed,
+          succeeded: cumulativeSucceeded,
+          skipped: cumulativeSkipped,
+          deferred: deferredCount,
+        });
         const parts: string[] = [];
-        if (incomingCount > 0) parts.push(`读取 ${incomingCount} 条视频`);
-        if (bilibiliBlocked) {
+        if (round > 1) parts.push(`分 ${round} 轮完成`);
+        if (cumulativeIncoming > 0) parts.push(`读取 ${cumulativeIncoming} 条视频`);
+        if (bilibiliSessionBlocked) {
           parts.push("哔站 Cookie 已失效，本轮未请求哔站博主；请重新运行 setup-sidecar.ps1 更新 Cookie 并重启网站后重试");
         }
         if (restrictionSkipped > 0) {
           parts.push(`平台访问受限，本轮跳过 ${restrictionSkipped} 位博主，稍后可重试`);
-        } else if (restrictedPlatforms.size > 0 && emptySnapshotSkipped === 0) {
+        } else if (restrictedPlatforms.size > 0 && cumulativeEmptySkipped === 0) {
           parts.push(`平台访问受限（${[...restrictedPlatforms].map((platform) => platform === "douyin" ? "抖音" : "哔站").join("、")}），稍后可重试`);
         }
-        if (emptySnapshotSkipped > 0) {
-          parts.push(`${emptySnapshotSkipped} 位博主返回 0 条投稿，已保留旧缓存（可能触发平台限流），稍后重试`);
+        if (cumulativeEmptySkipped > 0) {
+          parts.push(`${cumulativeEmptySkipped} 位博主返回 0 条投稿，已保留旧缓存（可能触发平台限流），稍后重试`);
         }
         if (deferredCount > 0) {
           parts.push(`哔站单轮最多同步 ${MAX_BILIBILI_CREATORS_PER_RUN} 位，剩余 ${deferredCount} 位将在下次同步继续`);
         }
-        if (failed > 0) parts.push(`${failed} 位博主同步失败，可重试`);
-        const message = parts.length ? parts.join("；") : `同步完成，读取 ${incomingCount} 条视频`;
+        if (cumulativeFailed > 0) parts.push(`${cumulativeFailed} 位博主同步失败，可重试`);
+        const message = parts.length ? parts.join("；") : `同步完成，读取 ${cumulativeIncoming} 条视频`;
         publish({
           status,
           message,
@@ -767,11 +871,13 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           skippedCreatorIds,
           restrictedPlatforms: Array.from(restrictedPlatforms),
         });
-        return failed === 0 && !bilibiliBlocked;
+        return cumulativeFailed === 0 && !bilibiliSessionBlocked;
+        }
+        return false;
       } catch (error) {
         const message = syncRequestError(error);
         publish({
-          status: processed ? "partial" : "error",
+          status: cumulativeSucceeded + succeeded > 0 ? "partial" : "error",
           message,
           currentStart: 0,
           currentEnd: 0,
