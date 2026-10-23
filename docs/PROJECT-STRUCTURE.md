@@ -49,9 +49,10 @@ Git 仓库只保存源码、配置模板、锁文件、测试和说明文档。�
 2. 安装 Node.js 24 LTS、Git；需要自动同步时另装 Python 3.11 和 Edge/Chrome。
 3. 执行 `npm ci`，再执行 `Copy-Item .env.example .env.local`。
 4. 需要自动同步时运行 `scripts/setup-sidecar.ps1`；然后运行 `npm run start:local` 启动网站。
-5. Windows 上运行 `npm run autostart:install`，让网站在当前用户登录后自动启动；移除启动项运行 `npm run autostart:remove`。
-6. 在浏览器中打开 `http://127.0.0.1:3000`。实时数据保存在该浏览器配置的 IndexedDB；迁移时从 `.local/personal-data/backups/` 选择 JSON 备份并通过“管理数据”导入。
-7. 执行 `npm run verify` 确认迁移后的环境可构建。
+5. 更新 Cookie（Edge/Chrome 127+ 的 App-Bound 加密使自动化脚本无法复用浏览器登录态）：按 README“获取 Cookie”从开发者工具复制，或只保存 `SESSDATA`、`bili_jct`、`DedeUserID` 三行到 `.local/cookie-input.txt` 后运行 `node scripts/set-bilibili-cookie.mjs`；再执行 `npm run stop:local`、`npm run start:local` 让 sidecar 重新读取。
+6. Windows 上运行 `npm run autostart:install`，让网站在当前用户登录后自动启动；移除启动项运行 `npm run autostart:remove`。
+7. 在浏览器中打开 `http://127.0.0.1:3000`。实时数据保存在该浏览器配置的 IndexedDB；迁移时从 `.local/personal-data/backups/` 选择 JSON 备份并通过“管理数据”导入。
+8. 执行 `npm run verify` 确认迁移后的环境可构建。
 
 ## 当前验证基线（2026-10-23）
 

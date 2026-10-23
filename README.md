@@ -136,6 +136,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-sidecar.ps1 -SkipInstal
 
 Cookie 等同于登录凭据。不要发给他人，不要写进源码、截图或聊天记录。本项目的 `.gitignore` 已排除 `.env.local` 和 `.local/`。
 
+Edge / Chrome 127 起用 App-Bound 加密保护 Cookie，自动化脚本无法复用浏览器里的登录态（复制配置或自动化登录窗口通常也会触发风控）。只想更新哔站 Cookie 时，可以只复制 `SESSDATA`、`bili_jct`、`DedeUserID` 三个值，各占一行保存为 `.local/cookie-input.txt`，然后运行：
+
+```powershell
+node scripts/set-bilibili-cookie.mjs
+npm run stop:local
+npm run start:local
+```
+
+脚本会校验这三个必需字段、自动补充匿名 `buvid3`/`buvid4`/`b_nut` 并备份旧 Cookie；重启后可用网站同步或 `curl` 请求 `/api/bilibili/session` 验证登录态。
+
 ### 3. 启动服务
 
 推荐使用统一启动脚本（网站和 sidecar 会在后台运行，重复执行会复用健康的服务）：
