@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isProviderFailureError, requestSyncBatch, SYNC_REQUEST_TIMEOUT_MS, SYNC_RETRY_DELAY_MS } from "@/lib/feed-sync";
+import { isProviderFailureError, isSyncBusyError, requestSyncBatch, SYNC_REQUEST_TIMEOUT_MS, SYNC_RETRY_DELAY_MS } from "@/lib/feed-sync";
 import type { Creator } from "@/lib/feed-types";
 
 const creator: Creator = {
@@ -215,6 +215,20 @@ describe("requestSyncBatch retry policy", () => {
     const error = await requestSyncBatch([creator], new AbortController().signal, []).catch((caught: unknown) => caught);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isProviderFailureError(error)).toBe(false);
+  });
+
+  it("marks 409 lock answers as busy instead of a provider failure", async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ error: "已有同步任务正在进行，请等待完成后重试" }),
+      { status: 409, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await requestSyncBatch([creator], new AbortController().signal, []).catch((caught: unknown) => caught);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isSyncBusyError(error)).toBe(true);
     expect(isProviderFailureError(error)).toBe(false);
   });
 });

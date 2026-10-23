@@ -31,6 +31,7 @@ import {
   getRestrictedSyncPlatform,
   isProviderFailureError,
   isProviderUnavailableFailure,
+  isSyncBusyError,
   MAX_BILIBILI_CREATORS_PER_RUN,
   MAX_CONSECUTIVE_PROVIDER_FAILURES,
   requestSyncBatch,
@@ -457,6 +458,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       let failed = 0;
       let skipped = 0;
       let blockedSkipped = 0;
+      let emptySnapshotSkipped = 0;
       let incomingCount = 0;
       const blockedPlatforms = new Set<Creator["platform"]>();
       const restrictionRetried = new Set<Creator["platform"]>();
@@ -466,6 +468,7 @@ export function FeedProvider({ children }: { children: ReactNode }) {
       let stateChanged = false;
       let consecutiveProviderFailures = 0;
       let providerInterrupted = false;
+      let busyInterrupted = false;
 
       const applyCreators = (next: Creator[]) => {
         creatorsRef.current = next;
@@ -601,6 +604,14 @@ export function FeedProvider({ children }: { children: ReactNode }) {
               interrupted = true;
               break;
             }
+            // Another sync (another tab/window) is still running: stop this run instead
+            // of marking the batch as a platform failure.
+            if (isSyncBusyError(error)) {
+              busyInterrupted = true;
+              interrupted = true;
+              publish({ message: "另一个同步任务正在进行，本轮已停止；请等待它完成后再试" });
+              break;
+            }
             const message = syncRequestError(error);
             const failedBatch = reconcileSyncBatch(batch, creatorsRef.current);
             const removedNow = failedBatch.removed.length;
@@ -661,13 +672,24 @@ export function FeedProvider({ children }: { children: ReactNode }) {
           setVideosState(merged.videos);
           stateChanged = true;
           const batchFailed = merged.failedCreatorIds.length;
+          const emptySkipped = merged.emptySnapshotCreatorIds.length;
           failed += batchFailed;
-          succeeded += applyBatch.length - batchFailed;
+          skipped += emptySkipped;
+          emptySnapshotSkipped += emptySkipped;
+          succeeded += applyBatch.length - batchFailed - emptySkipped;
           processed += applyBatch.length;
           incomingCount += merged.incomingCount;
           failedIdsRef.current = Array.from(new Set([...failedIdsRef.current, ...merged.failedCreatorIds]));
+          if (emptySkipped) {
+            skippedCreatorIds.push(...merged.emptySnapshotCreatorIds);
+            clearErrorsFor(merged.emptySnapshotCreatorIds);
+          }
           const restrictedPlatform = getRestrictedSyncPlatform(applyBatch, data);
           if (restrictedPlatform) restrictedPlatforms.add(restrictedPlatform);
+          // Several "complete but empty" answers in one batch mean rate limiting; stop
+          // this platform for the run and keep the old caches instead of counting failures.
+          const emptyRestricted = merged.suspiciousEmptySnapshot ? applyBatch[0]?.platform : null;
+          if (emptyRestricted) restrictedPlatforms.add(emptyRestricted);
           if (isProviderUnavailableFailure(data)) {
             consecutiveProviderFailures += 1;
             if (consecutiveProviderFailures >= MAX_CONSECUTIVE_PROVIDER_FAILURES) {
@@ -680,8 +702,8 @@ export function FeedProvider({ children }: { children: ReactNode }) {
             consecutiveProviderFailures = 0;
           }
           publish({
-            message: restrictedPlatform
-              ? `${restrictedPlatform === "douyin" ? "抖音" : "哔站"}触发访问限制，已停止该平台后续请求`
+            message: restrictedPlatform || emptyRestricted
+              ? `${(restrictedPlatform ?? emptyRestricted) === "douyin" ? "抖音" : "哔站"}触发访问限制，已停止该平台后续请求${emptySkipped ? `；${emptySkipped} 位返回 0 条投稿，已保留旧缓存` : ""}`
               : `已处理 ${processed}/${planned.length} 位博主，读取 ${incomingCount} 条视频`,
             restrictedPlatforms: Array.from(restrictedPlatforms),
           });
@@ -693,13 +715,15 @@ export function FeedProvider({ children }: { children: ReactNode }) {
         }
 
         if (interrupted) {
-          const message = providerInterrupted
-            ? `同步服务连续 ${consecutiveProviderFailures} 次失败或不稳定，已停止本轮同步；未处理的博主可直接重试`
-            : controller.signal.aborted
-              ? "同步已取消；已有缓存已保留"
-              : dataReplaceEpochRef.current !== replaceEpochAtStart
-                ? "本地数据已被替换，已停止应用后续结果"
-                : "数据在同步期间发生变化，已停止应用后续结果";
+          const message = busyInterrupted
+            ? "另一个同步任务正在进行，本轮已停止；请等待它完成后再试"
+            : providerInterrupted
+              ? `同步服务连续 ${consecutiveProviderFailures} 次失败或不稳定，已停止本轮同步；未处理的博主可直接重试`
+              : controller.signal.aborted
+                ? "同步已取消；已有缓存已保留"
+                : dataReplaceEpochRef.current !== replaceEpochAtStart
+                  ? "本地数据已被替换，已停止应用后续结果"
+                  : "数据在同步期间发生变化，已停止应用后续结果";
           const status: SyncStatus = succeeded > 0 && processed > 0 ? "partial" : "error";
           publish({
             status,
@@ -714,17 +738,20 @@ export function FeedProvider({ children }: { children: ReactNode }) {
         }
 
         const bilibiliBlocked = blockedPlatforms.has("bilibili");
-        const restrictedSkipped = skipped - blockedSkipped;
+        const restrictionSkipped = skipped - blockedSkipped - emptySnapshotSkipped;
         const status = computeSyncStatus({ failed, succeeded, skipped, deferred: deferredCount });
         const parts: string[] = [];
         if (incomingCount > 0) parts.push(`读取 ${incomingCount} 条视频`);
         if (bilibiliBlocked) {
           parts.push("哔站 Cookie 已失效，本轮未请求哔站博主；请重新运行 setup-sidecar.ps1 更新 Cookie 并重启网站后重试");
         }
-        if (restrictedSkipped > 0) {
-          parts.push(`平台访问受限，本轮跳过 ${restrictedSkipped} 位博主，稍后可重试`);
-        } else if (restrictedPlatforms.size > 0) {
+        if (restrictionSkipped > 0) {
+          parts.push(`平台访问受限，本轮跳过 ${restrictionSkipped} 位博主，稍后可重试`);
+        } else if (restrictedPlatforms.size > 0 && emptySnapshotSkipped === 0) {
           parts.push(`平台访问受限（${[...restrictedPlatforms].map((platform) => platform === "douyin" ? "抖音" : "哔站").join("、")}），稍后可重试`);
+        }
+        if (emptySnapshotSkipped > 0) {
+          parts.push(`${emptySnapshotSkipped} 位博主返回 0 条投稿，已保留旧缓存（可能触发平台限流），稍后重试`);
         }
         if (deferredCount > 0) {
           parts.push(`哔站单轮最多同步 ${MAX_BILIBILI_CREATORS_PER_RUN} 位，剩余 ${deferredCount} 位将在下次同步继续`);

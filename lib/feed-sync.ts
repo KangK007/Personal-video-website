@@ -60,6 +60,10 @@ export type SyncStateSnapshot = {
 
 export type SyncMergeResult = SyncStateSnapshot & {
   failedCreatorIds: string[];
+  /** Complete-but-empty results that kept their cache (first confirmation or bulk suspicion). */
+  emptySnapshotCreatorIds: string[];
+  /** Several creators in the same batch all returned "complete but empty": likely rate limiting. */
+  suspiciousEmptySnapshot: boolean;
   incomingCount: number;
   succeededCount: number;
 };
@@ -210,8 +214,9 @@ export function computeSyncStatus(input: {
 }): SyncStatus {
   const { failed, succeeded, skipped, deferred } = input;
   if (failed > 0) return succeeded > 0 ? "partial" : "error";
-  if (succeeded > 0) return skipped > 0 || deferred > 0 ? "partial" : "success";
-  return skipped > 0 || deferred > 0 ? "error" : "success";
+  // Skipped/empty/blocked results are incomplete work, never a platform failure.
+  if (skipped > 0 || deferred > 0) return "partial";
+  return "success";
 }
 
 /**
@@ -486,7 +491,22 @@ function withProviderFailureFlag(error: Error, source: unknown) {
     value: isProviderFailureError(source),
     enumerable: false,
   });
+  if (source instanceof SyncHttpError) {
+    Object.defineProperty(error, "httpStatus", {
+      value: source.status,
+      enumerable: false,
+    });
+  }
   return error;
+}
+
+/**
+ * True when the sync route refused the batch because another sync is still running.
+ * This is a temporary local condition, not a platform failure: the run should stop
+ * gracefully instead of labeling the whole batch as failed.
+ */
+export function isSyncBusyError(error: unknown): boolean {
+  return (error as { httpStatus?: unknown } | null)?.httpStatus === 409;
 }
 
 function asNonEmptyString(value: unknown) {
@@ -605,16 +625,32 @@ export function mergeSyncResponse(
   const cachedCreatorIds = new Set(
     state.videos.filter((video) => video.source === "feed-sync").map((video) => video.creatorId),
   );
-  const emptySnapshotDeferrals = new Map<string, string>();
-  for (const creatorId of [...completeIds]) {
-    if ((incomingByCreator.get(creatorId) ?? []).length > 0) continue;
+  const emptyCompleteIds = [...completeIds].filter((creatorId) => (incomingByCreator.get(creatorId) ?? []).length === 0);
+  // Batches of several creators that all answer "complete but empty" are almost always
+  // platform rate limiting, not accounts that deleted everything. Never treat them as
+  // confirmation (otherwise two bad runs would erase all caches), and report them as
+  // skipped so the client stops the platform for this run instead of counting failures.
+  const suspiciousEmptySnapshot = batch.length >= 2
+    && emptyCompleteIds.length >= 2
+    && emptyCompleteIds.length === completeIds.size;
+  const emptySnapshotCreatorIds: string[] = [];
+  const emptySnapshotIncrements = new Set<string>();
+  for (const creatorId of emptyCompleteIds) {
     const creator = creatorsById.get(creatorId);
-    if (!creator || !cachedCreatorIds.has(creatorId)) continue;
+    if (!creator) continue;
+    if (suspiciousEmptySnapshot) {
+      completeIds.delete(creatorId);
+      emptySnapshotCreatorIds.push(creatorId);
+      continue;
+    }
+    if (!cachedCreatorIds.has(creatorId)) continue;
     if ((creator.emptySnapshotCount ?? 0) < 1) {
       completeIds.delete(creatorId);
-      emptySnapshotDeferrals.set(creatorId, "平台返回 0 条投稿，已保留旧缓存；再次同步确认后将清空");
+      emptySnapshotCreatorIds.push(creatorId);
+      emptySnapshotIncrements.add(creatorId);
     }
   }
+  const emptySnapshotSet = new Set(emptySnapshotCreatorIds);
   const incoming = candidateVideos.filter((video) => completeIds.has(video.creatorId));
   const snapshotIds = new Set(results.flatMap((result) => (
     typeof result.creatorId === "string"
@@ -624,7 +660,9 @@ export function mergeSyncResponse(
       : []
   )));
   const failedCreatorIds = results
-    .filter((result) => typeof result.creatorId === "string" && !completeIds.has(result.creatorId))
+    .filter((result) => typeof result.creatorId === "string"
+      && !completeIds.has(result.creatorId)
+      && !emptySnapshotSet.has(result.creatorId))
     .map((result) => result.creatorId as string);
 
   const retained = state.videos.filter((video) => !snapshotIds.has(video.creatorId) || video.source !== "feed-sync");
@@ -655,13 +693,11 @@ export function mergeSyncResponse(
   const creators = state.creators.map((creator) => {
     const result = resultMap.get(creator.id);
     if (!result) return creator;
-    const deferredMessage = emptySnapshotDeferrals.get(creator.id);
-    if (deferredMessage) {
-      return {
-        ...creator,
-        syncError: deferredMessage,
-        emptySnapshotCount: Math.min((creator.emptySnapshotCount ?? 0) + 1, 10),
-      };
+    if (emptySnapshotSet.has(creator.id)) {
+      // Skipped, not failed: the cache is kept and the progress message explains it.
+      return emptySnapshotIncrements.has(creator.id)
+        ? { ...creator, emptySnapshotCount: Math.min((creator.emptySnapshotCount ?? 0) + 1, 10) }
+        : creator;
     }
     if (!completeIds.has(creator.id)) {
       return {
@@ -689,6 +725,8 @@ export function mergeSyncResponse(
     creators,
     videos: Array.from(byIdentity.values()),
     failedCreatorIds,
+    emptySnapshotCreatorIds,
+    suspiciousEmptySnapshot,
     incomingCount: incoming.length,
     succeededCount: completeIds.size,
   };

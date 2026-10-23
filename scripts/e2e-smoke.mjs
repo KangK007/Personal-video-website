@@ -99,6 +99,27 @@ function installSyncStub(context, state) {
       });
       return;
     }
+    if (state.syncMode === "empty") {
+      // A well-formed "complete" answer with zero videos: the UI must keep the cache
+      // and report it as skipped, not as a failure.
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          configured: true,
+          syncedAt: new Date().toISOString(),
+          videos: [],
+          results: creators.map((creator) => ({
+            creatorId: creator.id,
+            status: "success",
+            count: 0,
+            complete: true,
+            mode: "snapshot",
+          })),
+        }),
+      });
+      return;
+    }
     if (creators[0]?.platform === "bilibili" && (state.syncMode === "restriction" || state.restrictionOnceRemaining > 0)) {
       if (state.syncMode !== "restriction") state.restrictionOnceRemaining -= 1;
       await route.fulfill({
@@ -609,6 +630,27 @@ try {
   state.syncDelayMs = 0;
   await page.locator(".creator-list-page button", { hasText: "恢复" }).first().click();
   await page.waitForTimeout(400);
+
+  // -------------------------------------------------- 空结果保留缓存
+  section("平台返回 0 条投稿时保留缓存");
+  await page.locator('.main-nav a[href="/"]').click();
+  await page.waitForSelector(".video-card", { timeout: 10_000 });
+  const cardsBeforeEmptySync = await page.locator(".video-card").count();
+  state.syncMode = "empty";
+  await page.locator(".topbar-actions button", { hasText: "同步关注流" }).click();
+  await page.waitForFunction(() => document.querySelector(".sync-progress")?.textContent?.includes("返回 0 条投稿"), null, { timeout: 120_000 });
+  await page.waitForTimeout(400);
+  const emptyProgress = (await page.locator(".sync-progress").first().innerText()).replace(/\s+/g, " ");
+  check("空结果被说明为跳过且保留旧缓存", emptyProgress.includes("已保留旧缓存") && !emptyProgress.includes("同步失败"), emptyProgress);
+  check("空结果不计为本轮失败", /本轮失败 0/.test(emptyProgress), emptyProgress);
+  check("空结果不删除已有视频", (await page.locator(".video-card").count()) === cardsBeforeEmptySync,
+    `cards=${await page.locator(".video-card").count()} expected=${cardsBeforeEmptySync}`);
+  state.syncMode = "ok";
+  await page.locator(".topbar-actions button", { hasText: "同步关注流" }).click();
+  await waitSettled(page);
+  await page.waitForTimeout(500);
+  check("恢复正常同步后缓存恢复更新", (await page.locator(".video-card").count()) === cardsBeforeEmptySync,
+    `cards=${await page.locator(".video-card").count()} expected=${cardsBeforeEmptySync}`);
 
   // -------------------------------------------------------------- 备份/清空/导入
   section("备份导出 / 清空 / 导入");

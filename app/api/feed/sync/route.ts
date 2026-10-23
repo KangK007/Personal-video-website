@@ -52,9 +52,20 @@ type SyncProcessState = typeof globalThis & {
   __justFollowFeedSyncRunning?: boolean;
 };
 
-function tryAcquireSyncLock() {
+const SYNC_LOCK_WAIT_MS = 15_000;
+
+/**
+ * The route serves one sync at a time. A short wait absorbs overlapping requests from
+ * a timed-out retry or a second tab; only a genuinely long running sync causes 409.
+ */
+export async function acquireSyncLock(waitMs = SYNC_LOCK_WAIT_MS, signal?: AbortSignal) {
   const state = globalThis as SyncProcessState;
-  if (state.__justFollowFeedSyncRunning) return null;
+  const deadline = Date.now() + waitMs;
+  while (state.__justFollowFeedSyncRunning) {
+    if (signal?.aborted || Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (signal?.aborted) return null;
   state.__justFollowFeedSyncRunning = true;
   let released = false;
   return () => {
@@ -414,7 +425,7 @@ export async function POST(request: Request) {
     }, { status: 400 });
   }
 
-  const releaseSyncLock = tryAcquireSyncLock();
+  const releaseSyncLock = await acquireSyncLock(SYNC_LOCK_WAIT_MS, request.signal);
   if (!releaseSyncLock) {
     return NextResponse.json({ error: "已有同步任务正在进行，请等待完成后重试" }, { status: 409 });
   }

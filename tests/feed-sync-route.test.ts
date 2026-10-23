@@ -38,9 +38,10 @@ vi.mock("@/lib/server/bilibili-sync", () => ({
 }));
 
 let POST: typeof import("@/app/api/feed/sync/route").POST;
+let acquireSyncLock: typeof import("@/app/api/feed/sync/route").acquireSyncLock;
 
 beforeAll(async () => {
-  ({ POST } = await import("@/app/api/feed/sync/route"));
+  ({ POST, acquireSyncLock } = await import("@/app/api/feed/sync/route"));
 });
 
 afterEach(() => {
@@ -341,5 +342,32 @@ describe("feed sync route cancellation and cleanup", () => {
       status: "error",
       message: expect.stringContaining("缺少有效作品 ID"),
     });
+  });
+
+  it("waits briefly for a running sync instead of rejecting an overlapping request immediately", async () => {
+    const releaseFirst = await acquireSyncLock(50);
+    expect(typeof releaseFirst).toBe("function");
+    try {
+      const overlapping = await acquireSyncLock(300);
+      expect(overlapping).toBeNull();
+    } finally {
+      releaseFirst?.();
+    }
+
+    const releaseAfterWait = await acquireSyncLock(300);
+    expect(typeof releaseAfterWait).toBe("function");
+    releaseAfterWait?.();
+  });
+
+  it("stops waiting for the lock when the request is aborted", async () => {
+    const release = await acquireSyncLock(50);
+    try {
+      const controller = new AbortController();
+      const waiting = acquireSyncLock(2_000, controller.signal);
+      controller.abort();
+      expect(await waiting).toBeNull();
+    } finally {
+      release?.();
+    }
   });
 });

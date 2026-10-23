@@ -57,15 +57,15 @@ describe("mergeSyncResponse empty snapshot guard", () => {
     results: [{ creatorId: creator.id, status: "success", complete: true, count: 0 }],
   };
 
-  it("keeps cached videos on the first empty snapshot and asks for one confirmation", () => {
+  it("keeps cached videos on the first empty snapshot and counts it as skipped, not failed", () => {
     const first = merge([syncedVideo()], emptyResponse);
 
     expect(first.videos.map((item) => item.videoUrl)).toEqual(["https://www.bilibili.com/video/BV1old411c7mD"]);
-    expect(first.failedCreatorIds).toEqual([creator.id]);
-    expect(first.creators[0]).toMatchObject({
-      emptySnapshotCount: 1,
-      syncError: expect.stringContaining("保留旧缓存"),
-    });
+    expect(first.failedCreatorIds).toEqual([]);
+    expect(first.emptySnapshotCreatorIds).toEqual([creator.id]);
+    expect(first.suspiciousEmptySnapshot).toBe(false);
+    expect(first.creators[0]).toMatchObject({ emptySnapshotCount: 1 });
+    expect(first.creators[0].syncError).toBeUndefined();
   });
 
   it("clears cached videos on the second consecutive empty snapshot", () => {
@@ -75,14 +75,43 @@ describe("mergeSyncResponse empty snapshot guard", () => {
 
     expect(second.videos).toEqual([]);
     expect(second.failedCreatorIds).toEqual([]);
+    expect(second.emptySnapshotCreatorIds).toEqual([]);
     expect(second.creators[0].emptySnapshotCount).toBeUndefined();
     expect(second.creators[0].syncError).toBeUndefined();
+  });
+
+  it("treats a whole batch of empty answers as a suspicious platform limit, never as confirmation", () => {
+    const second: Creator = { ...creator, id: "creator-2", profileUrl: "https://space.bilibili.com/456", name: "Second" };
+    const third: Creator = { ...creator, id: "creator-3", profileUrl: "https://space.bilibili.com/789", name: "Third" };
+    const batch = [creator, second, third];
+    const state: FeedState = {
+      version: 2,
+      creators: batch,
+      videos: [
+        syncedVideo(),
+        syncedVideo({ id: "old-2", creatorId: second.id, videoUrl: "https://www.bilibili.com/video/BV1old211c7mD" }),
+      ],
+    };
+    const response: SyncResponse = {
+      syncedAt: "2026-10-23T02:00:00.000Z",
+      videos: [],
+      results: batch.map((item) => ({ creatorId: item.id, status: "success" as const, complete: true, count: 0 })),
+    };
+
+    const result = mergeSyncResponse(state, batch, response);
+
+    expect(result.suspiciousEmptySnapshot).toBe(true);
+    expect(result.emptySnapshotCreatorIds).toEqual(batch.map((item) => item.id));
+    expect(result.failedCreatorIds).toEqual([]);
+    expect(result.videos.length).toBe(2);
+    expect(result.creators.map((item) => item.emptySnapshotCount)).toEqual([undefined, undefined, undefined]);
   });
 
   it("accepts an empty snapshot when the creator has no cached feed-sync videos", () => {
     const result = merge([], emptyResponse);
 
     expect(result.failedCreatorIds).toEqual([]);
+    expect(result.emptySnapshotCreatorIds).toEqual([]);
     expect(result.videos).toEqual([]);
   });
 
@@ -422,8 +451,9 @@ describe("computeSyncStatus", () => {
     // Restriction/deferred skips mean the run is incomplete, not successful.
     expect(computeSyncStatus({ failed: 0, succeeded: 2, skipped: 3, deferred: 0 })).toBe("partial");
     expect(computeSyncStatus({ failed: 0, succeeded: 2, skipped: 0, deferred: 40 })).toBe("partial");
-    // Cookie-blocked runs sync nothing: the bar must not claim success.
-    expect(computeSyncStatus({ failed: 0, succeeded: 0, skipped: 5, deferred: 0 })).toBe("error");
+    // A run where everything was skipped (cookie blocked, rate limit, empty answers)
+    // is incomplete but nothing failed: "partial", not "同步失败".
+    expect(computeSyncStatus({ failed: 0, succeeded: 0, skipped: 5, deferred: 0 })).toBe("partial");
   });
 });
 
