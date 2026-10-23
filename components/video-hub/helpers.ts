@@ -106,6 +106,36 @@ export function sameEntityIds<T extends { id: string }>(items: T[], expected: Re
   return actual.size === expected.size && items.length === actual.size && [...actual].every((id) => expected.has(id));
 }
 
+/**
+ * Counts for the platform tabs, scoped by the *other* active filters so the numbers
+ * match what the tab will show when selected.
+ */
+export function countPlatforms<T extends { platform: Platform }>(
+  items: T[],
+  predicate?: (item: T) => boolean,
+) {
+  const scoped = predicate ? items.filter(predicate) : items;
+  return {
+    all: scoped.length,
+    douyin: scoped.filter((item) => item.platform === "douyin").length,
+    bilibili: scoped.filter((item) => item.platform === "bilibili").length,
+  };
+}
+
+/** Counts for the creator status tabs, scoped by the other active filters. */
+export function countFollowingStatuses(
+  creators: Creator[],
+  predicate?: (creator: Creator) => boolean,
+) {
+  const scoped = predicate ? creators.filter(predicate) : creators;
+  return {
+    all: scoped.length,
+    unsynced: scoped.filter((creator) => !creator.lastSyncAt && !creator.syncError).length,
+    failed: scoped.filter((creator) => Boolean(creator.syncError)).length,
+    paused: scoped.filter((creator) => !creator.enabled).length,
+  };
+}
+
 export function formatDate(value?: string) {
   const date = parsePublishedAt(value);
   return !date ? "发布时间未知" : SHORT_DATE_FORMATTER.format(date);

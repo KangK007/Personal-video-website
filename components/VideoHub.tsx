@@ -57,6 +57,8 @@ import {
   normalizeOptionalMediaUrl,
   appendUniqueCreators,
   appendUniqueVideo,
+  countFollowingStatuses,
+  countPlatforms,
   isResolvableShortVideoLink,
   parseCreatorLines,
   platformClass,
@@ -108,28 +110,45 @@ function openPlatformLink(event: MouseEvent<HTMLAnchorElement>, url: string) {
 
 function removeSavedVideo(
   video: VideoItem,
+  owner: Creator,
+  getCreators: () => Creator[],
+  setCreators: Dispatch<SetStateAction<Creator[]>>,
   setVideos: Dispatch<SetStateAction<VideoItem[]>>,
-  getDataEpoch: () => number,
-  canRestore: () => boolean,
   showNotice: (input: NoticeInput, duration?: number) => string,
   clearNotice: (id?: string) => void,
 ) {
   const videoKey = getFeedVideoIdentityKey(video.videoUrl, video.platform);
+  const ownerKey = getFeedCreatorIdentityKey(owner.profileUrl, owner.platform);
   setVideos((current) => current.filter((entry) => entry.id !== video.id));
-  const removalEpoch = getDataEpoch();
 
   let noticeId = "";
   const undo = () => {
-    if (getDataEpoch() !== removalEpoch || !canRestore()) {
-      clearNotice(noticeId);
-      showNotice({ kind: "info", text: "本地数据已变化，无法撤销这项操作" });
-      return;
+    const currentCreators = getCreators();
+    const ownerExists = currentCreators.some((creator) => (
+      getFeedCreatorIdentityKey(creator.profileUrl, creator.platform) === ownerKey
+    ));
+    // Undo works independently of other edits: restore the owner if it was removed
+    // too, then add the video back unless it is already present.
+    if (!ownerExists) {
+      setCreators((current) => current.some((creator) => (
+        getFeedCreatorIdentityKey(creator.profileUrl, creator.platform) === ownerKey
+      )) ? current : [...current, owner]);
     }
-    setVideos((current) => current.some((entry) => (
-      entry.id === video.id
-      || getFeedVideoIdentityKey(entry.videoUrl, entry.platform) === videoKey
-    )) || getDataEpoch() !== removalEpoch || !canRestore() ? current : [...current, video]);
+    const ownersAfter = ownerExists ? currentCreators : [...currentCreators, owner];
+    const canAttach = ownersAfter.some((creator) => creator.id === video.creatorId && creator.platform === video.platform);
+    let restored = false;
+    setVideos((current) => {
+      const exists = current.some((entry) => (
+        entry.id === video.id
+        || getFeedVideoIdentityKey(entry.videoUrl, entry.platform) === videoKey
+      ));
+      if (exists || !canAttach) return current;
+      restored = true;
+      return [...current, video];
+    });
     clearNotice(noticeId);
+    if (!canAttach) showNotice({ kind: "info", text: "归属博主已变化，视频未能恢复" });
+    else if (!restored) showNotice({ kind: "info", text: "视频已在本地，无需再次恢复" });
   };
 
   noticeId = showNotice({
@@ -237,7 +256,7 @@ function VideoCover({ video }: { video: VideoItem }) {
   return <div className={`cover-fallback ${platformClass(video.platform)}`} aria-label="封面不可用"><FilmSlate size={34} weight="duotone" aria-hidden="true" /></div>;
 }
 
-function VideoCard({ video, creator, view, onDelete }: { video: VideoItem; creator: Creator; view: VideoView; onDelete?: (video: VideoItem) => void }) {
+function VideoCard({ video, creator, view, onDelete }: { video: VideoItem; creator: Creator; view: VideoView; onDelete?: (video: VideoItem, creator: Creator) => void }) {
   const label = platformLabel(video.platform);
   return (
     <article className={`video-card ${platformClass(video.platform)} ${view === "list" ? "is-list" : ""}`}>
@@ -245,7 +264,7 @@ function VideoCard({ video, creator, view, onDelete }: { video: VideoItem; creat
         <VideoCover video={video} />
         {video.duration ? <span className="duration">{video.duration}</span> : null}
       </a>
-      {onDelete ? <button className="card-delete" type="button" onClick={() => onDelete(video)} aria-label={`删除视频：${video.title}`} title="删除视频"><Trash size={16} aria-hidden="true" /></button> : null}
+      {onDelete ? <button className="card-delete" type="button" onClick={() => onDelete(video, creator)} aria-label={`删除视频：${video.title}`} title="删除视频"><Trash size={16} aria-hidden="true" /></button> : null}
       <div className="video-card-body">
         <div className="video-meta-top"><span className={`platform-label ${platformClass(video.platform)}`}><span className="platform-mark" aria-hidden="true" />{label}</span><span className={!parsePublishedAt(video.publishedAt) ? "unknown-date" : ""}>{formatDate(video.publishedAt)}</span></div>
         <h3 className="video-title"><a href={video.videoUrl} target="_blank" rel="noopener" onClick={(event) => openPlatformLink(event, video.videoUrl)} onAuxClick={(event) => openPlatformLink(event, video.videoUrl)} aria-label={`在${label}打开：${video.title}`}>{video.title}</a></h3>
@@ -536,7 +555,7 @@ function PageFrame({ active, children, openCreator, openVideo, settingsOpen, set
 }
 
 function RecentView({ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: FrameProps) {
-  const { creators, videos, isHydrated, setVideos, getDataEpoch, syncFeed } = useFeed();
+  const { creators, videos, isHydrated, setCreators, setVideos, syncFeed } = useFeed();
   const { preferences, setVideoView } = useUiPreferences();
   const { showNotice, clearNotice } = useNotice();
   const creatorsRef = useRef(creators);
@@ -549,22 +568,30 @@ function RecentView({ openCreator, openVideo, settingsOpen, setSettingsOpen, onE
   const enabledIds = useMemo(() => new Set(creators.filter((creator) => creator.enabled).map((creator) => creator.id)), [creators]);
   const creatorById = useMemo(() => new Map(creators.map((creator) => [creator.id, creator])), [creators]);
   const recentBase = useMemo(() => videos.filter((video) => enabledIds.has(video.creatorId) && isRecentVideo(video, now)), [enabledIds, now, videos]);
-  const counts = useMemo(() => ({ all: recentBase.length, douyin: recentBase.filter((video) => video.platform === "douyin").length, bilibili: recentBase.filter((video) => video.platform === "bilibili").length }), [recentBase]);
-  const filtered = useMemo(() => { const needle = query.trim().toLocaleLowerCase(); return sortVideos(recentBase.filter((video) => platformMatches(platform, video.platform)).filter((video) => !needle || video.title.toLocaleLowerCase().includes(needle) || creatorById.get(video.creatorId)?.name.toLocaleLowerCase().includes(needle))); }, [creatorById, platform, query, recentBase]);
+  const matchesVideoQuery = useCallback((video: VideoItem) => {
+    const needle = query.trim().toLocaleLowerCase();
+    return !needle
+      || video.title.toLocaleLowerCase().includes(needle)
+      || creatorById.get(video.creatorId)?.name.toLocaleLowerCase().includes(needle);
+  }, [creatorById, query]);
+  // Platform tab counts follow the active search so they describe the visible feed.
+  const searchBase = useMemo(() => recentBase.filter(matchesVideoQuery), [matchesVideoQuery, recentBase]);
+  const counts = useMemo(() => countPlatforms(searchBase), [searchBase]);
+  const filtered = useMemo(() => sortVideos(searchBase.filter((video) => platformMatches(platform, video.platform))), [platform, searchBase]);
   const displayed = filtered.slice(0, visibleCount);
   const groups = displayed.reduce<Record<string, VideoItem[]>>((result, video) => { const key = parsePublishedAt(video.publishedAt)?.toDateString() ?? "unknown"; (result[key] ??= []).push(video); return result; }, {});
   const today = new Date(now).toDateString();
   const yesterday = new Date(now - DAY_MS).toDateString();
   const latestSync = Math.max(...creators.map((creator) => parsePublishedAt(creator.lastSyncAt)?.getTime() ?? 0), 0);
-  const removeVideo = (video: VideoItem) => removeSavedVideo(video, setVideos, getDataEpoch, () => creatorsRef.current.some((creator) => creator.id === video.creatorId && creator.platform === video.platform), showNotice, clearNotice);
+  const removeVideo = (video: VideoItem, owner: Creator) => removeSavedVideo(video, owner, () => creatorsRef.current, setCreators, setVideos, showNotice, clearNotice);
   if (!isHydrated) return <PageFrame active="recent" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><LoadingState /></PageFrame>;
   const emptyKind: EmptyKind = !creators.length ? "no-creators" : !recentBase.length ? "no-recent" : query.trim() ? "no-match" : platform !== "all" ? "no-platform" : "no-match";
-  return <PageFrame active="recent" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><PageHeader eyebrow="FOLLOWING FEED" title="最近更新" subtitle="最近 7 天 · 按发布时间排序" stat={`${formatCount(filtered.length)} 条结果 · ${new Set(filtered.map((video) => video.creatorId)).size} 位博主 · 最近同步 ${formatDateTime(latestSync ? new Date(latestSync).toISOString() : undefined)}`} action={<button className="primary-button" type="button" onClick={openCreator}><Plus size={18} aria-hidden="true" />添加博主</button>} /><div className="content-toolbar"><PlatformTabs value={platform} onChange={(value) => { setPlatform(value); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} counts={counts} /><SearchBox value={query} onChange={(value) => { setQuery(value); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} placeholder="搜索博主或视频" /><ViewModeToggle value={preferences.videoView} onChange={setVideoView} /></div>{filtered.length === 0 ? <EmptyState kind={emptyKind} onAdd={openCreator} onSync={() => void syncFeed()} onClear={() => { setQuery(""); setPlatform("all"); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} query={query} platform={platform} /> : <section className="feed-section"><div className="section-heading-row"><div><h2>本周更新</h2><span className="section-subtitle">平台总数 {formatCount(counts.all)} · 当前显示 {formatCount(filtered.length)}</span></div><button className="quiet-action" type="button" onClick={() => setSettingsOpen(true)}><GearSix size={17} aria-hidden="true" />管理数据</button></div>{Object.entries(groups).map(([key, items]) => <div className="date-group" key={key}><h3><CalendarBlank size={16} aria-hidden="true" />{key === "unknown" ? "日期未知" : key === today ? "今天" : key === yesterday ? "昨天" : formatDate(items[0].publishedAt)}</h3><div className={`video-grid ${preferences.videoView === "list" ? "is-list" : ""}`}>{items.map((video) => { const creator = creatorById.get(video.creatorId); return creator ? <VideoCard key={video.id} video={video} creator={creator} view={preferences.videoView} onDelete={video.source === "manual" || video.source === "public-metadata" ? removeVideo : undefined} /> : null; })}</div></div>)}{displayed.length < filtered.length ? <div className="load-more-row"><button className="secondary-button" type="button" onClick={() => setVisibleCount((count) => count + VISIBLE_VIDEO_BATCH_SIZE)}>加载更多<span>还剩 {formatCount(filtered.length - displayed.length)} 条</span></button></div> : null}</section>}</PageFrame>;
+  return <PageFrame active="recent" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><PageHeader eyebrow="FOLLOWING FEED" title="最近更新" subtitle="最近 7 天 · 按发布时间排序" stat={`${formatCount(filtered.length)} 条结果 · ${new Set(filtered.map((video) => video.creatorId)).size} 位博主 · 最近同步 ${formatDateTime(latestSync ? new Date(latestSync).toISOString() : undefined)}`} action={<button className="primary-button" type="button" onClick={openCreator}><Plus size={18} aria-hidden="true" />添加博主</button>} /><div className="content-toolbar"><PlatformTabs value={platform} onChange={(value) => { setPlatform(value); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} counts={counts} /><SearchBox value={query} onChange={(value) => { setQuery(value); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} placeholder="搜索博主或视频" /><ViewModeToggle value={preferences.videoView} onChange={setVideoView} /></div>{filtered.length === 0 ? <EmptyState kind={emptyKind} onAdd={openCreator} onSync={() => void syncFeed()} onClear={() => { setQuery(""); setPlatform("all"); setVisibleCount(VISIBLE_VIDEO_BATCH_SIZE); }} query={query} platform={platform} /> : <section className="feed-section"><div className="section-heading-row"><div><h2>本周更新</h2><span className="section-subtitle">筛选结果 {formatCount(counts.all)} · 当前显示 {formatCount(filtered.length)}</span></div><button className="quiet-action" type="button" onClick={() => setSettingsOpen(true)}><GearSix size={17} aria-hidden="true" />管理数据</button></div>{Object.entries(groups).map(([key, items]) => <div className="date-group" key={key}><h3><CalendarBlank size={16} aria-hidden="true" />{key === "unknown" ? "日期未知" : key === today ? "今天" : key === yesterday ? "昨天" : formatDate(items[0].publishedAt)}</h3><div className={`video-grid ${preferences.videoView === "list" ? "is-list" : ""}`}>{items.map((video) => { const creator = creatorById.get(video.creatorId); return creator ? <VideoCard key={video.id} video={video} creator={creator} view={preferences.videoView} onDelete={video.source === "manual" || video.source === "public-metadata" ? removeVideo : undefined} /> : null; })}</div></div>)}{displayed.length < filtered.length ? <div className="load-more-row"><button className="secondary-button" type="button" onClick={() => setVisibleCount((count) => count + VISIBLE_VIDEO_BATCH_SIZE)}>加载更多<span>还剩 {formatCount(filtered.length - displayed.length)} 条</span></button></div> : null}</section>}</PageFrame>;
 }
 
 function FollowingView({ openCreator, openVideo, openFollowing, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: FrameProps) {
   const { creators, videos, isHydrated, setCreators, setVideos, getDataEpoch, syncFeed, syncStatus, syncProgress, retryFailed } = useFeed();
-  const { showNotice, clearNotice, clearAllNotices } = useNotice();
+  const { showNotice, clearNotice } = useNotice();
   const creatorsRef = useRef(creators);
   const videosRef = useRef(videos);
   useEffect(() => { creatorsRef.current = creators; videosRef.current = videos; }, [creators, videos]);
@@ -573,42 +600,66 @@ function FollowingView({ openCreator, openVideo, openFollowing, settingsOpen, se
   const [query, setQuery] = useState("");
   const [confirmCreator, setConfirmCreator] = useState<Creator | null>(null);
   const stats = useMemo(() => { const latestById = new Map<string, string | undefined>(); const latestMsById = new Map<string, number>(); const countById = new Map<string, number>(); videos.forEach((video) => { countById.set(video.creatorId, (countById.get(video.creatorId) ?? 0) + 1); const timestamp = videoTimestamp(video); if (timestamp > (latestMsById.get(video.creatorId) ?? Number.NEGATIVE_INFINITY)) { latestMsById.set(video.creatorId, timestamp); latestById.set(video.creatorId, video.publishedAt); } }); return { latestById, latestMsById, countById }; }, [videos]);
-  const counts = useMemo(() => ({ all: creators.length, douyin: creators.filter((creator) => creator.platform === "douyin").length, bilibili: creators.filter((creator) => creator.platform === "bilibili").length }), [creators]);
-  const statusCounts = useMemo(() => ({ all: creators.length, unsynced: creators.filter((creator) => !creator.lastSyncAt && !creator.syncError).length, failed: creators.filter((creator) => Boolean(creator.syncError)).length, paused: creators.filter((creator) => !creator.enabled).length }), [creators]);
+  const matchesCreatorQuery = useCallback((creator: Creator) => {
+    const needle = query.trim().toLocaleLowerCase();
+    return !needle || creator.name.toLocaleLowerCase().includes(needle);
+  }, [query]);
+  const matchesCreatorStatus = useCallback((creator: Creator) => (
+    status === "all"
+    || (status === "unsynced" && !creator.lastSyncAt && !creator.syncError)
+    || (status === "failed" && Boolean(creator.syncError))
+    || (status === "paused" && !creator.enabled)
+  ), [status]);
+  const matchesCreatorPlatform = useCallback((creator: Creator) => platformMatches(platform, creator.platform), [platform]);
+  // Each tab group is scoped by the *other* active filters so its numbers stay honest.
+  const counts = useMemo(
+    () => countPlatforms(creators, (creator) => matchesCreatorStatus(creator) && matchesCreatorQuery(creator)),
+    [creators, matchesCreatorQuery, matchesCreatorStatus],
+  );
+  const statusCounts = useMemo(
+    () => countFollowingStatuses(creators, (creator) => matchesCreatorPlatform(creator) && matchesCreatorQuery(creator)),
+    [creators, matchesCreatorPlatform, matchesCreatorQuery],
+  );
   const skippedThisRun = useMemo(() => new Set(syncProgress.skippedCreatorIds), [syncProgress.skippedCreatorIds]);
-  const filtered = useMemo(() => { const needle = query.trim().toLocaleLowerCase(); return creators.filter((creator) => platformMatches(platform, creator.platform)).filter((creator) => status === "all" || status === "unsynced" && !creator.lastSyncAt && !creator.syncError || status === "failed" && Boolean(creator.syncError) || status === "paused" && !creator.enabled).filter((creator) => !needle || creator.name.toLocaleLowerCase().includes(needle)).sort((a, b) => (stats.latestMsById.get(b.id) ?? Number.NEGATIVE_INFINITY) - (stats.latestMsById.get(a.id) ?? Number.NEGATIVE_INFINITY)); }, [creators, platform, query, stats.latestMsById, status]);
+  const filtered = useMemo(() => creators
+    .filter((creator) => matchesCreatorPlatform(creator) && matchesCreatorStatus(creator) && matchesCreatorQuery(creator))
+    .sort((a, b) => (stats.latestMsById.get(b.id) ?? Number.NEGATIVE_INFINITY) - (stats.latestMsById.get(a.id) ?? Number.NEGATIVE_INFINITY)),
+  [creators, matchesCreatorPlatform, matchesCreatorQuery, matchesCreatorStatus, stats.latestMsById]);
   const unfollow = useCallback((creator: Creator) => {
-    clearAllNotices();
+    // Do not clear pending notices: a previous delete may still be undoable, and the
+    // new undo queues behind it instead of destroying it.
     const snapshot = { creator, videos: videos.filter((video) => video.creatorId === creator.id) };
-    const expectedCreatorIds = new Set(creators.filter((item) => item.id !== creator.id).map((item) => item.id));
-    const expectedVideoIds = new Set(videos.filter((video) => video.creatorId !== creator.id).map((video) => video.id));
     setCreators((current) => current.filter((item) => item.id !== creator.id));
     setVideos((current) => current.filter((video) => video.creatorId !== creator.id));
-    const removalEpoch = getDataEpoch();
     setConfirmCreator(null);
     let noticeId = "";
     const undo = () => {
-      const currentCreators = creatorsRef.current;
-      const currentVideos = videosRef.current;
       const identityKey = getFeedCreatorIdentityKey(snapshot.creator.profileUrl, snapshot.creator.platform);
-      const canRestore = getDataEpoch() === removalEpoch
-        && sameEntityIds(currentCreators, expectedCreatorIds)
-        && sameEntityIds(currentVideos, expectedVideoIds)
-        && !currentCreators.some((item) => getFeedCreatorIdentityKey(item.profileUrl, item.platform) === identityKey);
-      if (!canRestore) {
-        clearNotice(noticeId);
-        showNotice({ kind: "info", text: "本地数据已变化，无法撤销这项操作" });
+      const alreadyExists = creatorsRef.current.some((item) => (
+        getFeedCreatorIdentityKey(item.profileUrl, item.platform) === identityKey
+      ));
+      clearNotice(noticeId);
+      if (alreadyExists) {
+        showNotice({ kind: "info", text: "这位博主已在关注列表中，无需再次撤销" });
         return;
       }
-      setCreators((current) => current.some((item) => item.id === snapshot.creator.id) ? current : [...current, snapshot.creator]);
+      // Identity-based undo: works even after unrelated edits (a deleted video, a
+      // sync finishing, etc.) instead of rejecting the whole undo.
+      setCreators((current) => [...current, snapshot.creator]);
       setVideos((current) => {
-        const known = new Set(current.map((video) => video.id));
-        return [...current, ...snapshot.videos.filter((video) => !known.has(video.id))];
+        const knownIds = new Set(current.map((video) => video.id));
+        const knownKeys = new Set(current.map((video) => getFeedVideoIdentityKey(video.videoUrl, video.platform)));
+        return [
+          ...current,
+          ...snapshot.videos.filter((video) => (
+            !knownIds.has(video.id)
+            && !knownKeys.has(getFeedVideoIdentityKey(video.videoUrl, video.platform))
+          )),
+        ];
       });
-      clearNotice(noticeId);
     };
     noticeId = showNotice({ kind: "success", text: `已取消关注 ${creator.name}`, action: { label: "撤销", onClick: undo } }, 10_000);
-  }, [clearAllNotices, clearNotice, creators, getDataEpoch, setCreators, setVideos, showNotice, videos]);
+  }, [clearNotice, setCreators, setVideos, showNotice, videos]);
   if (!isHydrated) return <PageFrame active="following" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><LoadingState /></PageFrame>;
   const kind: EmptyKind = !creators.length ? "no-creators" : "no-following-match";
   // The bulk retry only targets enabled creators (paused ones keep their error).
@@ -617,7 +668,7 @@ function FollowingView({ openCreator, openVideo, openFollowing, settingsOpen, se
 }
 
 function CreatorDetail({ creatorId, openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }: FrameProps & { creatorId: string }) {
-  const { creators, videos, isHydrated, setVideos, getDataEpoch, syncFeed, syncStatus } = useFeed();
+  const { creators, videos, isHydrated, setCreators, setVideos, syncFeed, syncStatus } = useFeed();
   const { preferences, setVideoView } = useUiPreferences();
   const { showNotice, clearNotice } = useNotice();
   const creatorsRef = useRef(creators);
@@ -627,7 +678,7 @@ function CreatorDetail({ creatorId, openCreator, openVideo, settingsOpen, setSet
   const [visibleCount, setVisibleCount] = useState(VISIBLE_VIDEO_BATCH_SIZE);
   const allVideos = useMemo(() => sortVideos(videos.filter((video) => video.creatorId === creatorId)), [creatorId, videos]);
   const filtered = useMemo(() => { const needle = query.trim().toLocaleLowerCase(); return needle ? allVideos.filter((video) => video.title.toLocaleLowerCase().includes(needle)) : allVideos; }, [allVideos, query]);
-  const removeVideo = (video: VideoItem) => removeSavedVideo(video, setVideos, getDataEpoch, () => creatorsRef.current.some((creator) => creator.id === video.creatorId && creator.platform === video.platform), showNotice, clearNotice);
+  const removeVideo = (video: VideoItem, owner: Creator) => removeSavedVideo(video, owner, () => creatorsRef.current, setCreators, setVideos, showNotice, clearNotice);
   if (!isHydrated) return <PageFrame active="following" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><LoadingState /></PageFrame>;
   if (!creator) return <PageFrame active="following" {...{ openCreator, openVideo, settingsOpen, setSettingsOpen, onExport, onImport, onClear }}><div className="not-found-state"><span className="empty-icon"><UserCirclePlus size={30} aria-hidden="true" /></span><h1>博主不存在或已取消关注</h1><p>这条个人页只在当前浏览器的关注名单里有效。</p><Link className="secondary-button" href="/following"><ArrowLeft size={18} aria-hidden="true" />返回关注列表</Link></div></PageFrame>;
   const displayed = filtered.slice(0, visibleCount);
@@ -640,7 +691,7 @@ export function VideoHub({ view = "recent", creatorId }: { view?: HubView; creat
   const [pendingBackup, setPendingBackup] = useState<FeedState | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const { creators, videos, dataAvailable, replaceState, setVideos, setCreators, storageStatus, syncStatus } = useFeed();
-  const { showNotice, clearAllNotices } = useNotice();
+  const { showNotice } = useNotice();
   const creatorsRef = useRef(creators);
   const videosRef = useRef(videos);
   useEffect(() => { creatorsRef.current = creators; videosRef.current = videos; }, [creators, videos]);
@@ -652,9 +703,23 @@ export function VideoHub({ view = "recent", creatorId }: { view?: HubView; creat
   const onExport = useCallback(() => { const payload = { version: 2, exportedAt: new Date().toISOString(), creators, videos }; const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }); if (blob.size > MAX_BACKUP_FILE_BYTES) { showNotice({ kind: "error", text: "当前数据超过 64 MB 备份上限，请先减少本地视频数量" }); return; } const link = document.createElement("a"); const objectUrl = URL.createObjectURL(blob); link.href = objectUrl; link.download = `just-follow-feed-${new Date().toISOString().slice(0, 10)}.json`; link.click(); window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000); showNotice({ kind: "success", text: "备份已导出" }); }, [creators, showNotice, videos]);
   const onImport = useCallback(() => fileRef.current?.click(), []);
   const onFileChange = useCallback(async (event: ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0]; event.target.value = ""; if (!file) return; if (syncStatus === "loading") { showNotice({ kind: "info", text: "同步进行中，请完成或取消同步后再导入备份" }); return; } if (file.size > MAX_BACKUP_FILE_BYTES) { showNotice({ kind: "error", text: "备份文件超过 64 MB，已停止读取" }); return; } try { const parsed = JSON.parse(await file.text()); const state = migrateFeedState(parsed); if (!state) throw new Error("备份格式不受支持、数据超限或存在损坏记录"); setSettingsOpen(false); setPendingBackup(state); } catch (error) { showNotice({ kind: "error", text: error instanceof Error ? error.message : "备份文件无法读取" }); } }, [showNotice, syncStatus]);
-  const confirmImport = useCallback(() => { if (!pendingBackup || syncStatus === "loading") return; clearAllNotices(); replaceState(pendingBackup); setPendingBackup(null); setSettingsOpen(false); showNotice({ kind: "success", text: `已导入 ${pendingBackup.creators.length} 位博主和 ${pendingBackup.videos.length} 条视频` }); }, [clearAllNotices, pendingBackup, replaceState, showNotice, syncStatus]);
+  const confirmImport = useCallback(() => {
+    if (!pendingBackup || syncStatus === "loading") return;
+    // Keep any pending undo notice: it fails gracefully if the replaced data makes it
+    // stale, but it must not be silently destroyed by an import.
+    replaceState(pendingBackup);
+    setPendingBackup(null);
+    setSettingsOpen(false);
+    showNotice({ kind: "success", text: `已导入 ${pendingBackup.creators.length} 位博主和 ${pendingBackup.videos.length} 条视频` });
+  }, [pendingBackup, replaceState, showNotice, syncStatus]);
   const clearAll = useCallback(() => { if (!dataReady || syncStatus === "loading") return; setModal("clear"); }, [dataReady, syncStatus]);
-  const confirmClear = useCallback(() => { if (!dataReady) return; clearAllNotices(); replaceState({ version: 2, creators: [], videos: [] }); setModal(null); setSettingsOpen(false); showNotice({ kind: "success", text: "本地数据已清空" }); }, [clearAllNotices, dataReady, replaceState, showNotice]);
+  const confirmClear = useCallback(() => {
+    if (!dataReady) return;
+    replaceState({ version: 2, creators: [], videos: [] });
+    setModal(null);
+    setSettingsOpen(false);
+    showNotice({ kind: "success", text: "本地数据已清空" });
+  }, [dataReady, replaceState, showNotice]);
   const existingUrls = useMemo(() => new Set(creators.map((creator) => getFeedCreatorIdentityKey(creator.profileUrl, creator.platform))), [creators]);
   const addCreators = useCallback((items: CreatorDraft[]) => {
     if (!dataReady) return "本地数据尚未就绪，请先完成恢复";

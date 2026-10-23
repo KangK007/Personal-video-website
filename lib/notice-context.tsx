@@ -37,6 +37,9 @@ type NoticeContextValue = {
 };
 
 const DEFAULT_NOTICE_DURATION = 10_000;
+// Keep a short backlog: a deferred notice can carry an undo action, so it must not
+// be silently overwritten by the next operation's toast.
+const MAX_QUEUED_NOTICES = 3;
 const NoticeContext = createContext<NoticeContextValue | null>(null);
 let noticeSequence = 0;
 
@@ -83,6 +86,9 @@ export function NoticeProvider({ children }: { children: ReactNode }) {
     const nextNotice = { ...input, id: createNoticeId(), duration: effectiveDuration };
     if (currentNoticeRef.current?.action) {
       queuedNoticesRef.current.push(nextNotice);
+      if (queuedNoticesRef.current.length > MAX_QUEUED_NOTICES) {
+        queuedNoticesRef.current.splice(0, queuedNoticesRef.current.length - MAX_QUEUED_NOTICES);
+      }
       return nextNotice.id;
     }
     clearTimer();
