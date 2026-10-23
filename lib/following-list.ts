@@ -1,7 +1,7 @@
 import type { Platform } from "@/lib/feed-types";
 
 export const FOLLOWING_LIMIT = 10_000;
-export const FOLLOWING_FILE_BYTES = 16 * 1024 * 1024;
+export const FOLLOWING_FILE_BYTES = 32 * 1024 * 1024;
 
 export type FollowingCreator = {
   platform: Platform;

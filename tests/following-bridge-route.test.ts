@@ -55,6 +55,25 @@ describe("following browser bridge routes", () => {
     expect(await consumed.json()).toMatchObject({ error: expect.stringContaining("已失效") });
   });
 
+  it("accepts a payload larger than the old 8 MB cap and rejects one above 24 MB", async () => {
+    const sessionResponse = await sessionPost(localRequest({}));
+    const session = await sessionResponse.json() as { token: string };
+    const post = (padding: number) => bridgePost(new Request("http://127.0.0.1:3000/api/following/bridge", {
+      method: "POST",
+      headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "content-type": "application/json" },
+      body: JSON.stringify({
+        token: session.token,
+        payload: { account: { id: "9", name: "账号" }, total: 0, creators: [] },
+        padding: "x".repeat(padding),
+      }),
+    }));
+
+    // A 10k list with long avatars can exceed the old cap; it must still hand off.
+    expect((await post(9 * 1024 * 1024)).status).toBe(200);
+    // The raised cap is still enforced.
+    expect((await post(25 * 1024 * 1024)).status).toBe(413);
+  });
+
   it("distinguishes an unknown or expired session from a pending one", async () => {
     const unknown = await resultPost(new Request("http://127.0.0.1:3000/api/following/bridge/result", {
       method: "POST",

@@ -4,7 +4,9 @@ import { normalizeFollowingBridgePayload, setFollowingBridgePayload } from "@/li
 
 export const runtime = "nodejs";
 
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
+// A full 10k list with long avatar URLs can exceed 8 MB; keep a generous cap so a
+// successful extraction is not discarded at handoff time.
+const MAX_BODY_BYTES = 24 * 1024 * 1024;
 
 export async function POST(request: Request) {
   let body: unknown;

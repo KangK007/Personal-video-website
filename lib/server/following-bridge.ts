@@ -11,7 +11,8 @@ import {
   type FollowingResult,
 } from "@/lib/following-list";
 
-const SESSION_TTL_MS = 10 * 60 * 1_000;
+// Large following lists can take minutes to collect before the browser handoff.
+const SESSION_TTL_MS = 30 * 60 * 1_000;
 const MAX_SESSIONS = 8;
 
 export type FollowingBridgePayload = {

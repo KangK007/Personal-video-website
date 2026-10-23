@@ -41,6 +41,14 @@ describe("following browser bridge", () => {
     expect(consumeFollowingBridgePayload(session.token)).toBeNull();
   });
 
+  it("keeps a session valid long enough for a large list to finish collecting", () => {
+    const session = createFollowingBridgeSession();
+    const ttl = session.expiresAt - Date.now();
+    // Collecting hundreds of pages can take many minutes before the handoff starts.
+    expect(ttl).toBeGreaterThan(20 * 60 * 1_000);
+    expect(ttl).toBeLessThanOrEqual(30 * 60 * 1_000 + 1_000);
+  });
+
   it("keeps a paginated failure marked partial even when counts happen to match", () => {
     const payload = normalizeFollowingBridgePayload({
       account: { id: "123", name: "当前账号" },
